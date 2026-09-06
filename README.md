@@ -18,22 +18,44 @@ Two 24/7 services plus Telegram control, designed for one small Oracle Cloud Inf
 - Uses Gemini Decision Agent for fair probability / edge / action
 - Uses deterministic Python risk gates
 - Uses a deterministic execution layer; live order placement remains disabled until a verified adapter is installed
-- Telegram reports the research, decision and execution state
+- Persists research/signal history for later Telegram questions
 
-Premier League priority uses team/league detection plus event proximity and market liquidity/volume. Fixtures are treated as mutable because the official Premier League schedule is subject to broadcast and UEFA-related changes; the league has published further 2026/27 amendments in September 2026. citeturn726160search2turn726160search0turn726160search10
+Premier League priority uses team/league detection plus event proximity and market liquidity/volume. Fixtures are treated as mutable because official fixtures can change.
 
 ## Gemini roles
-
-Configure your five credentials as two research fallbacks, two decision fallbacks and one spare execution credential:
 
 ```text
 GEMINI_RESEARCH_KEYS=GEMINI_API_KEY_1,GEMINI_API_KEY_4
 GEMINI_DECISION_KEYS=GEMINI_API_KEY_2,GEMINI_API_KEY_5
+GEMINI_CHAT_KEYS=GEMINI_API_KEY_3,GEMINI_API_KEY_1
 ```
 
-The code falls back across the configured credentials when a credential returns quota/auth errors. **Five keys in one Gemini project do not create five independent quota pools**; use legitimately separate project/credential allocations where applicable.
+The research agent uses Gemini web search grounding. Role pools fail over across configured credentials when quota/auth errors occur. Multiple keys in one Gemini project do not create independent quota pools; use credentials/projects you legitimately control.
 
-The research agent uses Gemini's current Google Search grounding tool, which lets the model retrieve current public web information and ground answers in search results. citeturn416786search4turn416786search5
+## Telegram AI chat
+
+You can now ask the bot about what has happened so far:
+
+```text
+/ask what has happened in the trading so far?
+/ask what Premier League markets are we most interested in?
+/ask why did we skip the last trade?
+/ask what signals have appeared today?
+```
+
+The Telegram assistant reads the persistent trading state, recent signal log, research history, and system flags. It is an analysis/chat interface only; `/ask` cannot place or modify trades.
+
+Other commands:
+
+```text
+/status
+/pause
+/resume
+/kill
+/signals
+```
+
+`/kill` creates a persistent stop marker in the shared state volume. `/resume` removes it. Live Polymarket execution still requires a separately verified executor and explicit configuration.
 
 ## Architecture
 
@@ -67,9 +89,13 @@ The research agent uses Gemini's current Google Search grounding tool, which let
                                   Polymarket
 ```
 
+## Crypto / Robinhood / NFT status
+
+The original crypto monitor remains in the repository and is still used by the `meme-monitor` service. It fetches Robinhood-specific crypto news, extracts explicit token symbols, cross-checks those symbols against DexScreener liquidity/volume, scans liquid/trending pairs, and optionally queries Reservoir for configured NFT collections. Signals are persisted to the shared state volume and sent to Telegram.
+
 ## OCI deployment
 
-Create an Ubuntu Ampere A1 Flex VM in your OCI home region and use `ops/cloud-init.yaml`. Oracle documents the current Always Free A1 compute allocation and OCI Container Instances as alternatives. citeturn726160search11
+Create an Ubuntu Ampere A1 Flex VM in your OCI home region and use `ops/cloud-init.yaml`.
 
 On the VM:
 
@@ -81,20 +107,6 @@ bash ops/deploy.sh
 ```
 
 Keep `DRY_RUN=true` initially.
-
-## Telegram
-
-The control service uses long polling. Commands:
-
-```text
-/status
-/pause
-/resume
-/kill
-/signals
-```
-
-`/kill` creates a persistent stop marker in the shared state volume. `/resume` removes it.
 
 ## GitHub → OCI auto-deploy
 
