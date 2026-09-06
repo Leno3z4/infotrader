@@ -10,6 +10,7 @@ from polymarket_trader.premier_league import priority_score
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 DATA_POSITIONS_URL = "https://data-api.polymarket.com/positions"
+PL_DISCOVERY_QUERIES = ("Premier League", "Arsenal", "Liverpool", "Manchester United", "Manchester City", "Chelsea", "Tottenham")
 
 
 def _json_list(value: Any) -> list:
@@ -51,9 +52,14 @@ def get_open_markets(limit: int = 20, keyword: str | None = None) -> list[dict]:
 
 
 def get_priority_markets(limit: int = 10) -> list[dict]:
-    """Return a mixed discovery set, with Premier League markets boosted."""
-    candidates = get_open_markets(limit=max(25, limit * 4))
-    ranked = sorted(candidates, key=priority_score, reverse=True)
+    """Build a mixed discovery set, guaranteeing a Premier League scan when available."""
+    combined: dict[tuple[str | None, str | None], dict] = {}
+    for query in PL_DISCOVERY_QUERIES:
+        for market in get_open_markets(limit=max(10, limit), keyword=query):
+            combined[(market.get("id"), market.get("slug"))] = market
+    for market in get_open_markets(limit=max(30, limit * 4)):
+        combined[(market.get("id"), market.get("slug"))] = market
+    ranked = sorted(combined.values(), key=priority_score, reverse=True)
     return ranked[:limit]
 
 
