@@ -1,0 +1,21 @@
+# OCI Compute cloud-init for Ubuntu on Ampere A1.
+# Paste this as the instance's cloud-init when creating the VM.
+# The repository is public; runtime secrets stay in /home/ubuntu/infotrader/.env.
+# After the VM is ready, SSH in once and create .env from .env.example.
+
+#cloud-config
+package_update: true
+packages:
+  - git
+  - curl
+
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker ubuntu
+  - mkdir -p /home/ubuntu/infotrader
+  - chown -R ubuntu:ubuntu /home/ubuntu/infotrader
+  - sudo -u ubuntu git clone https://github.com/Leno3z4/infotrader.git /home/ubuntu/infotrader
+  - sudo -u ubuntu bash -c 'cd /home/ubuntu/infotrader && cp .env.example .env'
+  - sudo -u ubuntu bash -c 'cd /home/ubuntu/infotrader && docker compose build'
+
+final_message: "InfoTrader OCI host bootstrap complete. SSH in, edit /home/ubuntu/infotrader/.env, then run ops/deploy.sh."
