@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -19,6 +20,9 @@ from polymarket_trader.market_data import get_market_news, get_open_markets, get
 MARKET_KEYWORD = os.getenv("POLYMARKET_KEYWORD")
 MAX_MARKETS_PER_RUN = int(os.getenv("MAX_MARKETS_PER_RUN", "5"))
 POLYMARKET_PROFILE_ADDRESS = os.getenv("POLYMARKET_PROFILE_ADDRESS")
+STATE_DIR = Path(os.getenv("STATE_DIR", "/app/state"))
+PAUSED_FILE = STATE_DIR / "PAUSED"
+STOP_FILE = STATE_DIR / "STOP"
 
 
 def _find_token_index(market: dict, outcome: str | None) -> int | None:
@@ -29,6 +33,10 @@ def _find_token_index(market: dict, outcome: str | None) -> int | None:
 
 
 def run_once() -> None:
+    if STOP_FILE.exists() or PAUSED_FILE.exists():
+        send_telegram(f"⏸️ Polymarket bot skipped (kill_switch={STOP_FILE.exists()}, paused={PAUSED_FILE.exists()}).")
+        return
+
     rotator = GeminiRotator()
     markets = get_open_markets(limit=MAX_MARKETS_PER_RUN, keyword=MARKET_KEYWORD)
     if not markets:
@@ -83,7 +91,11 @@ def main() -> None:
         run_once()
         return
     while True:
-        run_once()
+        try:
+            run_once()
+        except Exception as exc:
+            print(f"[polymarket] {type(exc).__name__}: {exc}")
+            send_telegram(f"⚠️ Polymarket bot error: {type(exc).__name__}: {exc}")
         time.sleep(3600)
 
 
