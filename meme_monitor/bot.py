@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -17,13 +18,30 @@ MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 NEWS_LIQUIDITY_USD = float(os.getenv("NEWS_LIQUIDITY_USD", "2500"))
 NFT_COLLECTIONS = [s.strip() for s in os.getenv("NFT_COLLECTIONS", "").split(",") if s.strip()]
 WATCH_TOKENS = [s.strip().upper() for s in os.getenv("WATCH_TOKENS", "").split(",") if s.strip()]
+STATE_DIR = Path(os.getenv("STATE_DIR", "/app/state"))
+PAUSED_FILE = STATE_DIR / "PAUSED"
+STOP_FILE = STATE_DIR / "STOP"
+SIGNALS_LOG = STATE_DIR / "signals.log"
 
 
 def _format_liquidity(hit: dict) -> str:
     return f"{hit.get('symbol') or '?'} on {hit.get('chain')}/{hit.get('dex')}: liq ${hit['liquidity_usd']:,.0f}, vol24h ${hit['volume_24h_usd']:,.0f}, 24h {hit['price_change_24h_pct']:+.2f}%"
 
 
+def _record(message: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with SIGNALS_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " " + message.replace("\n", " ")[:1000] + "\n")
+
+
 def run_once() -> None:
+    if STOP_FILE.exists():
+        send_telegram("⛔ InfoTrader kill switch is active; meme monitor skipped.")
+        return
+    if PAUSED_FILE.exists():
+        send_telegram("⏸️ InfoTrader is paused; meme monitor skipped.")
+        return
+
     lines = ["<b>Hourly Market Intelligence</b>"]
     news = get_robinhood_news()
     lines.append("\n<b>Robinhood / token news</b>")
@@ -68,6 +86,7 @@ def run_once() -> None:
 
     message = "\n".join(lines)
     print(message)
+    _record(message)
     send_telegram(message)
 
 
@@ -79,7 +98,11 @@ def main() -> None:
         run_once()
         return
     while True:
-        run_once()
+        try:
+            run_once()
+        except Exception as exc:
+            print(f"[meme-monitor] {type(exc).__name__}: {exc}")
+            send_telegram(f"⚠️ Meme monitor error: {type(exc).__name__}: {exc}")
         time.sleep(3600)
 
 
