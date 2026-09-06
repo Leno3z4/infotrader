@@ -1,0 +1,11 @@
+# Local secrets / state
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite3
+polymarket_trader/STOP
+polymarket_trader/daily_state.json
+.DS_Store
