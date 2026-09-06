@@ -24,6 +24,7 @@ POLYMARKET_PROFILE_ADDRESS = os.getenv("POLYMARKET_PROFILE_ADDRESS")
 STATE_DIR = Path(os.getenv("STATE_DIR", "/app/state"))
 PAUSED_FILE = STATE_DIR / "PAUSED"
 STOP_FILE = STATE_DIR / "STOP"
+RESEARCH_LOG = STATE_DIR / "research.log"
 
 
 def _find_token_index(market: dict, outcome: str | None) -> int | None:
@@ -37,6 +38,18 @@ def _signal_log(line: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with (STATE_DIR / "signals.log").open("a", encoding="utf-8") as handle:
         handle.write(line.replace("\n", " ") + "\n")
+
+
+def _research_log(market: dict, research: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    compact = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "question": market.get("question"),
+        "is_premier_league": is_premier_league_market(str(market.get("question") or "")),
+        "research": research,
+    }
+    with RESEARCH_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(str(compact)[:10000] + "\n")
 
 
 def run_once() -> None:
@@ -61,6 +74,7 @@ def run_once() -> None:
     for market in markets:
         try:
             research = research_market(market, researcher)
+            _research_log(market, research)
             news = get_market_news(market["question"])
             position = get_position_for_market(POLYMARKET_PROFILE_ADDRESS, market) if POLYMARKET_PROFILE_ADDRESS else None
             decision = decide(market, news, research=research, position=position, rotator=decision_agent)
