@@ -8,12 +8,12 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       - run: pip install -r requirements.txt
       - name: Run meme/news monitor
         run: python meme_monitor/bot.py --once
@@ -28,15 +28,15 @@ jobs:
 
   polymarket:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     needs: monitor
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: Run Polymarket analyst
+      - name: Run Polymarket research/decision/execution simulation
         run: python polymarket_trader/bot.py --once
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
@@ -44,10 +44,11 @@ jobs:
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          GEMINI_RESEARCH_KEYS: GEMINI_API_KEY_1,GEMINI_API_KEY_4
+          GEMINI_DECISION_KEYS: GEMINI_API_KEY_2,GEMINI_API_KEY_5
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          POLYMARKET_KEYWORD: ${{ vars.POLYMARKET_KEYWORD }}
           MAX_MARKETS_PER_RUN: ${{ vars.MAX_MARKETS_PER_RUN }}
           POLYMARKET_PROFILE_ADDRESS: ${{ vars.POLYMARKET_PROFILE_ADDRESS }}
           MAX_POSITION_USD: ${{ vars.MAX_POSITION_USD }}
