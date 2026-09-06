@@ -58,7 +58,7 @@ DRY_RUN=true
 
 ```bash
 cd /home/ubuntu/infotrader
-./ops/deploy.sh
+bash ops/deploy.sh
 ```
 
 Check:
@@ -84,7 +84,7 @@ Commands:
 /signals
 ```
 
-`/kill` creates a persistent stop marker in the shared state volume. `/resume` removes it. Live Polymarket trading is still separately disabled by `DRY_RUN=true`.
+`/kill` creates a persistent stop marker in the shared state volume. `/resume` removes it. Live Polymarket execution is still separately disabled by `DRY_RUN=true`.
 
 ## 5. GitHub → OCI auto-deploy
 
