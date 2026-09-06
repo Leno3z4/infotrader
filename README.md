@@ -1,82 +1,119 @@
 # InfoTrader
 
-Two hourly market-intelligence jobs:
+Two 24/7 market-intelligence services plus a Telegram control service, designed to run on one small OCI Compute VM.
 
 - **Meme / mint / NFT monitor**: Robinhood-related crypto news, explicit ticker extraction, DEX liquidity/volume cross-checks, liquid trending pairs, and configured NFT collection stats.
 - **Polymarket analyst**: open markets + recent news + optional current positions → Gemini proposal → Python risk gate → dry-run execution notification.
+- **Telegram control**: `/status`, `/pause`, `/resume`, `/kill`, `/signals`.
 
-## What changed from the initial ZIP
+## Architecture
 
-The initial skeleton was a good start, but it was not accurate enough to call production-ready. This version:
+```text
+GitHub main
+   │  push
+   ▼
+GitHub Actions ──SSH──> OCI Compute VM
+                          │
+                          ├── meme-monitor
+                          ├── polymarket-trader
+                          └── telegram-control
+                                 │
+                                 ▼
+                              Telegram
+```
 
-- stops guessing that the first Polymarket outcome is the trade target;
-- only permits an outcome Gemini actually named and that exists in the market;
-- optionally loads the configured profile's current positions from Polymarket's public Data API;
-- improves news/ticker extraction and DEX liquidity cross-checking;
-- adds Telegram message chunking;
-- adds five-key-capable Gemini failover with cooldowns;
-- adds hard daily trade limits alongside size/confidence/loss limits;
-- adds tests and a GitHub Actions hourly workflow;
-- keeps live Polymarket execution disabled until the current wallet/signing adapter is separately verified.
+Oracle documents Always Free Ampere A1 compute in the home region; an Always Free tenancy gets the equivalent of 2 OCPUs and 12 GB RAM total across A1 instances. OCI Container Instances and OCI Container Registry are also supported alternatives. See Oracle's current Always Free and Container Instance documentation before provisioning. citeturn552222search0turn552222search8
 
-## Gemini fallback
+## 1. Create the OCI VM
 
-Configure `GEMINI_API_KEY_1` through `_5`. The rotator is intended for resilience across credentials/projects you are legitimately allowed to use. Gemini documents rate limits at the **project** level, so multiple keys inside one project do not multiply its quota.
+Use an Ubuntu A1 Flex VM in your **home region**. Keep the total Always Free A1 allocation within Oracle's current published limits. Oracle's Ubuntu login user is `ubuntu`. citeturn552222search0turn552222search4
 
-## Setup
+When creating the instance, paste the contents of `ops/cloud-init.yaml` into cloud-init. This installs Docker, clones the public repository, and builds the image.
+
+## 2. Configure secrets on the VM
+
+SSH into the VM and edit:
+
+```bash
+nano /home/ubuntu/infotrader/.env
+```
+
+At minimum:
+
+```text
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+GEMINI_API_KEY_1=...
+```
+
+Add `_2` through `_5` only for separate credentials/projects you legitimately control. Keys in one Gemini project do not multiply that project's quota.
+
+For the initial deployment keep:
+
+```text
+DRY_RUN=true
+```
+
+## 3. Start the services
+
+```bash
+cd /home/ubuntu/infotrader
+./ops/deploy.sh
+```
+
+Check:
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+The Compose services use `restart: unless-stopped`, and the risk/command state is stored in the named Docker volume `bot-state`, so ordinary container recreation does not erase it.
+
+## 4. Telegram
+
+The control service uses Telegram long polling, so the VM does not need a public HTTPS endpoint just to receive commands. Telegram also supports HTTPS webhooks if you later decide to put an ingress layer in front of it. citeturn552222search2
+
+Commands:
+
+```text
+/status
+/pause
+/resume
+/kill
+/signals
+```
+
+`/kill` creates a persistent stop marker in the shared state volume. `/resume` removes it. Live Polymarket trading is still separately disabled by `DRY_RUN=true`.
+
+## 5. GitHub → OCI auto-deploy
+
+The workflow `.github/workflows/deploy-oci.yml` runs tests on every push to `main`, then SSHes to OCI and runs the deployment commands.
+
+Add these GitHub Actions secrets:
+
+```text
+OCI_HOST
+OCI_USER
+OCI_SSH_PRIVATE_KEY
+```
+
+`OCI_SSH_PORT` is optional and defaults to 22.
+
+The SSH user must have Docker access. The standard Ubuntu account on OCI is `ubuntu`. citeturn552222search4
+
+## 6. Local development
 
 ```bash
 python -m venv .venv
 pip install -r requirements.txt
-cp .env.example .env
-```
-
-Run one pass:
-
-```bash
+pytest -q
 python meme_monitor/bot.py --once
 python polymarket_trader/bot.py --once
 ```
 
-Run tests:
-
-```bash
-pytest -q
-```
-
-## Bot A configuration
-
-```text
-MIN_LIQUIDITY_USD=5000
-NEWS_LIQUIDITY_USD=2500
-WATCH_TOKENS=PEPE,DOGE
-NFT_COLLECTIONS=collection-slug-a,collection-slug-b
-RESERVOIR_API_KEY=
-```
-
-## Bot B configuration
-
-```text
-POLYMARKET_KEYWORD=
-MAX_MARKETS_PER_RUN=5
-POLYMARKET_PROFILE_ADDRESS=
-MAX_POSITION_USD=5
-MAX_DAILY_LOSS_USD=15
-MAX_TRADES_PER_DAY=5
-MIN_CONFIDENCE=0.65
-DRY_RUN=true
-```
-
-Create a local kill switch with `touch polymarket_trader/STOP` and remove the file to resume.
-
 ## Polymarket live trading status
 
-The code intentionally does **not** pretend the live adapter is ready. Polymarket's older `py-clob-client` is archived, and Polymarket now recommends the newer unified Python SDK. Current 2026 production issues have also been reported around the deposit-wallet / Poly1271 order-signing flow. The repository therefore separates analysis from execution and keeps the executor in dry-run mode until a tested adapter is chosen.
+The repository deliberately separates analysis/risk from execution. `DRY_RUN=true` is the safe default. Do not switch it off until the current Polymarket signing/wallet adapter has been independently verified, position reconciliation is in place, and the system has been observed in dry-run mode.
 
-For a persistent live deployment, do not rely on an hourly GitHub Actions job as the source of truth for mutable risk state. Use a persistent worker or external state store.
-
-## GitHub Actions
-
-`.github/workflows/hourly.yml` runs at minute 7 of every hour and can also be started manually. Credentials go in Actions **Secrets**; non-sensitive tuning values go in Actions **Variables**.
-
-The included workflow always sets `DRY_RUN=true` for the Polymarket job.
+For a persistent live trading service, OCI is a better host than an hourly GitHub Actions job because mutable state remains on the VM and the containers can restart automatically.
