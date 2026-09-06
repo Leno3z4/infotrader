@@ -1,0 +1,39 @@
+services:
+  meme-monitor:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "meme_monitor.bot"]
+    env_file: .env
+    volumes:
+      - bot-state:/app/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; print('ok' if os.path.exists('/app/meme_monitor/bot.py') else 'missing')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+  polymarket-trader:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "polymarket_trader.bot"]
+    env_file: .env
+    volumes:
+      - bot-state:/app/state
+    environment:
+      DRY_RUN: ${DRY_RUN:-true}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; print('ok' if os.path.exists('/app/polymarket_trader/bot.py') else 'missing')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+  telegram-control:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "common.telegram_control"]
+    env_file: .env
+    volumes:
+      - bot-state:/app/state
+
+volumes:
+  bot-state:
