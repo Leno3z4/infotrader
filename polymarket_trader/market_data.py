@@ -4,7 +4,9 @@ import json
 from typing import Any
 
 import requests
+
 from meme_monitor.scraper import get_news
+from polymarket_trader.premier_league import priority_score
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 DATA_POSITIONS_URL = "https://data-api.polymarket.com/positions"
@@ -34,15 +36,25 @@ def get_open_markets(limit: int = 20, keyword: str | None = None) -> list[dict]:
         print(f"[market_data] Gamma API failed: {exc}")
         return []
     markets = payload if isinstance(payload, list) else payload.get("markets", [])
-    return [{
-        "id": m.get("id"), "condition_id": m.get("conditionId"),
-        "question": m.get("question"), "slug": m.get("slug"),
-        "clob_token_ids": _json_list(m.get("clobTokenIds")),
-        "outcomes": _json_list(m.get("outcomes")),
-        "outcome_prices": _json_list(m.get("outcomePrices")),
-        "volume_24h": m.get("volume24hr"), "liquidity": m.get("liquidity"),
-        "end_date": m.get("endDate"),
-    } for m in markets]
+    normalized = []
+    for m in markets:
+        normalized.append({
+            "id": m.get("id"), "condition_id": m.get("conditionId"),
+            "question": m.get("question"), "slug": m.get("slug"),
+            "clob_token_ids": _json_list(m.get("clobTokenIds")),
+            "outcomes": _json_list(m.get("outcomes")),
+            "outcome_prices": _json_list(m.get("outcomePrices")),
+            "volume_24h": m.get("volume24hr"), "liquidity": m.get("liquidity"),
+            "end_date": m.get("endDate"),
+        })
+    return normalized
+
+
+def get_priority_markets(limit: int = 10) -> list[dict]:
+    """Return a mixed discovery set, with Premier League markets boosted."""
+    candidates = get_open_markets(limit=max(25, limit * 4))
+    ranked = sorted(candidates, key=priority_score, reverse=True)
+    return ranked[:limit]
 
 
 def get_market_news(question: str, max_items: int = 6) -> list[dict]:
