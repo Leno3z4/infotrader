@@ -49,13 +49,17 @@ async def send_telegram(env, message: str) -> bool:
     chat_id = getattr(env, "TELEGRAM_CHAT_ID", None)
     if not token or not chat_id:
         return False
-    response = await fetch(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        method="POST",
-        headers={"content-type": "application/json"},
-        body=json.dumps({"chat_id": chat_id, "text": message[:4000]}),
-    )
-    return bool(response.ok)
+    try:
+        response = await fetch(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            method="POST",
+            headers={"content-type": "application/json"},
+            body=json.dumps({"chat_id": chat_id, "text": message[:4000]}),
+        )
+        return bool(response.ok)
+    except Exception as exc:
+        print(f"TELEGRAM ERROR: {type(exc).__name__}: {exc}")
+        return False
 
 
 def authorized(request, env) -> bool:
@@ -127,7 +131,10 @@ class Default(WorkerEntrypoint):
             return
         scan = "polymarket" if controller.cron == POLYMARKET_CRON else "crypto" if controller.cron == CRYPTO_CRON else None
         if scan:
-            await self.run_scan(scan, store)
+            try:
+                await self.run_scan(scan, store)
+            except Exception as exc:
+                print(f"SCHEDULE ERROR: {scan}: {type(exc).__name__}: {exc}")
 
     def _has_gemini(self) -> bool:
         for name in (
@@ -138,18 +145,31 @@ class Default(WorkerEntrypoint):
                 return True
         return False
 
-    async def run_scan(self, scan: str, store: StateStore) -> dict:
-        if await store.flag("STOP"):
-            return await store.record_scan(scan, "stopped", {})
-        if await store.flag("PAUSED"):
-            return await store.record_scan(scan, "paused", {})
+    async def _record_scan_error(self, store: StateStore, scan: str, exc: Exception) -> dict:
+        payload = {"error": f"{type(exc).__name__}: {exc}"}
         try:
+            return await store.record_scan(scan, "error", payload)
+        except Exception as record_exc:
+            print(f"SCAN RECORD ERROR: {scan}: {type(record_exc).__name__}: {record_exc}")
+            return {
+                "scan": scan,
+                "status": "error",
+                "payload": payload,
+                "storage_error": f"{type(record_exc).__name__}: {record_exc}",
+            }
+
+    async def run_scan(self, scan: str, store: StateStore) -> dict:
+        try:
+            if await store.flag("STOP"):
+                return await store.record_scan(scan, "stopped", {})
+            if await store.flag("PAUSED"):
+                return await store.record_scan(scan, "paused", {})
             payload = await self.scan_polymarket(store) if scan == "polymarket" else await self.scan_crypto(store)
             event = await store.record_scan(scan, "ok", payload)
             await send_telegram(self.env, self.format_alert(scan, payload))
             return event
         except Exception as exc:
-            event = await store.record_scan(scan, "error", {"error": f"{type(exc).__name__}: {exc}"})
+            event = await self._record_scan_error(store, scan, exc)
             await send_telegram(self.env, f"InfoTrader {scan} scan error: {event['payload']['error']}")
             return event
 
@@ -183,14 +203,20 @@ class Default(WorkerEntrypoint):
                 try:
                     research = await research_client.research(query)
                     research_results.append({"subject": subject, **research})
-                    await store.record_research("polymarket", subject, research)
+                    try:
+                        await store.record_research("polymarket", subject, research)
+                    except Exception as exc:
+                        research_results.append({"subject": subject, "storage_error": f"{type(exc).__name__}: {exc}"})
                 except Exception as exc:
                     research_results.append({"subject": subject, "error": f"{type(exc).__name__}: {exc}"})
             if decision_client and research and research.get("text"):
                 try:
                     decision = await decision_client.decide(self._decision_prompt(market, research))
                     decisions.append({"subject": subject, **decision})
-                    await store.record_decision("polymarket", subject, decision)
+                    try:
+                        await store.record_decision("polymarket", subject, decision)
+                    except Exception as exc:
+                        decisions.append({"subject": subject, "storage_error": f"{type(exc).__name__}: {exc}"})
                 except Exception as exc:
                     decisions.append({"subject": subject, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -264,7 +290,13 @@ class Default(WorkerEntrypoint):
             try:
                 client = GeminiRotator(self.env, "RESEARCH")
                 gemini_notes = await client.research(self._crypto_research_prompt(headlines, pairs, nfts))
-                await store.record_research("crypto", "Robinhood/crypto intelligence", gemini_notes)
+                try:
+                    await store.record_research("crypto", "Robinhood/crypto intelligence", gemini_notes)
+                except Exception as exc:
+                    gemini_notes = {
+                        **gemini_notes,
+                        "storage_error": f"{type(exc).__name__}: {exc}",
+                    }
             except Exception as exc:
                 gemini_notes = {"error": f"{type(exc).__name__}: {exc}"}
 
