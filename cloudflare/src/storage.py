@@ -7,12 +7,21 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from workers import env as worker_env
+
 
 class StateStore:
     """Persist control flags, scan state, research and decision history."""
 
     def __init__(self, env: Any):
+        # HTTP handlers expose bindings through the WorkerEntrypoint env object.
+        # Scheduled invocations can provide an env object that does not surface
+        # the Python Worker binding as expected, while the runtime's global
+        # workers.env still resolves the deployed bindings. Prefer the explicit
+        # env argument and fall back to the runtime global for robustness.
         self._kv = getattr(env, "INFOTRADER_STATE", None)
+        if self._kv is None:
+            self._kv = getattr(worker_env, "INFOTRADER_STATE", None)
 
     @property
     def available(self) -> bool:
