@@ -126,15 +126,25 @@ class Default(WorkerEntrypoint):
 
     async def scheduled(self, controller, env, ctx):
         store = StateStore(env)
+        cron = getattr(controller, "cron", None)
+        scan = POLYMARKET_CRON if cron == POLYMARKET_CRON else CRYPTO_CRON if cron == CRYPTO_CRON else None
+        print(f"CRON FIRED: expression={cron!r} scan={scan!r}")
         if not store.available:
-            print("INFOTRADER_STATE is not configured; scheduled scan skipped")
+            print("CRON STORAGE MISSING: INFOTRADER_STATE is not configured; scheduled scan skipped")
             return
-        scan = "polymarket" if controller.cron == POLYMARKET_CRON else "crypto" if controller.cron == CRYPTO_CRON else None
-        if scan:
-            try:
-                await self.run_scan(scan, store)
-            except Exception as exc:
-                print(f"SCHEDULE ERROR: {scan}: {type(exc).__name__}: {exc}")
+        try:
+            await store.record_cron(cron or "unknown", scan)
+        except Exception as exc:
+            print(f"CRON HEARTBEAT ERROR: {type(exc).__name__}: {exc}")
+            return
+        if not scan:
+            print(f"CRON UNKNOWN: no scan mapped for expression={cron!r}")
+            return
+        try:
+            result = await self.run_scan(scan, store)
+            print(f"CRON COMPLETE: scan={scan} status={result.get('status')}")
+        except Exception as exc:
+            print(f"SCHEDULE ERROR: scan={scan}: {type(exc).__name__}: {exc}")
 
     def _has_gemini(self) -> bool:
         for name in (
