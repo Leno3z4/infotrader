@@ -48,7 +48,7 @@ async def send_telegram(env, message: str) -> bool:
     token = getattr(env, "TELEGRAM_BOT_TOKEN", None)
     chat_id = getattr(env, "TELEGRAM_CHAT_ID", None)
     if not token or not chat_id:
-        print("TELEGRAM SKIPPED: token/chat id not configured")
+        print("TELEGRAM NOT CONFIGURED")
         return False
     try:
         response = await fetch(
@@ -57,11 +57,11 @@ async def send_telegram(env, message: str) -> bool:
             headers={"content-type": "application/json"},
             body=json.dumps({"chat_id": chat_id, "text": message[:4000]}),
         )
-        if response.ok:
-            print("TELEGRAM SENT: ok")
-            return True
-        print(f"TELEGRAM FAILED: HTTP {response.status}")
-        return False
+        if not response.ok:
+            print(f"TELEGRAM HTTP ERROR: status={response.status}")
+            return False
+        print("TELEGRAM SENT")
+        return True
     except Exception as exc:
         print(f"TELEGRAM ERROR: {type(exc).__name__}: {exc}")
         return False
@@ -77,6 +77,8 @@ class Default(WorkerEntrypoint):
         path = urlparse(request.url).path
         store = StateStore(self.env)
         if path == "/health":
+            opensea_key_configured = bool(getattr(self.env, "OPENSEA_API_KEY", None))
+            nft_collections_configured = bool(str(getattr(self.env, "NFT_COLLECTIONS", "")).strip())
             return Response.json({
                 "ok": True,
                 "service": "infotrader",
@@ -84,7 +86,14 @@ class Default(WorkerEntrypoint):
                 "storage_bound": store.available,
                 "gemini_configured": self._has_gemini(),
                 "telegram_configured": self._has_telegram(),
-                "opensea_configured": bool(getattr(self.env, "OPENSEA_API_KEY", None)),
+                "opensea_configured": opensea_key_configured,
+                "opensea_status": (
+                    "ready"
+                    if opensea_key_configured and nft_collections_configured
+                    else "missing_api_key"
+                    if not opensea_key_configured
+                    else "missing_nft_collections"
+                ),
             })
         if path == "/status":
             try:
@@ -131,55 +140,46 @@ class Default(WorkerEntrypoint):
         })
 
     async def scheduled(self, controller, env, ctx):
-        print("INFOTRADER CRON HANDLER ENTERED")
+        """Run the scheduled scan; Telegram is reserved for useful scan results/errors."""
+        print("CRON HANDLER ENTERED")
+        cron = getattr(controller, "cron", None)
+        print(f"CRON CONTROLLER: {cron!r}")
+
+        store = StateStore(env)
+        print(f"CRON STORAGE AVAILABLE: {store.available}")
+
+        scan = (
+            POLYMARKET_CRON
+            if cron == POLYMARKET_CRON
+            else CRYPTO_CRON
+            if cron == CRYPTO_CRON
+            else None
+        )
+        print(f"CRON DISPATCH: scan={scan!r}")
+
+        if not store.available:
+            print("CRON STORAGE MISSING: INFOTRADER_STATE is not configured; scheduled scan skipped")
+            return
+
         try:
-            # Use the WorkerEntrypoint environment consistently. This is the same
-            # environment used by fetch(), including KV bindings and secrets.
-            runtime_env = self.env
-            cron = getattr(controller, "cron", None)
-            scheduled_time = getattr(controller, "scheduledTime", None)
-            print(f"CRON CONTROLLER: cron={cron!r} scheduledTime={scheduled_time!r}")
-
-            store = StateStore(runtime_env)
-            print(f"CRON STORAGE: available={store.available}")
-            if not store.available:
-                print("CRON STORAGE MISSING: INFOTRADER_STATE is not configured")
-                return
-
-            scan = (
-                POLYMARKET_CRON
-                if cron == POLYMARKET_CRON
-                else CRYPTO_CRON
-                if cron == CRYPTO_CRON
-                else None
-            )
-            print(f"CRON DISPATCH: scan={scan!r}")
-
-            # Send a proof-of-execution message before the scan. This also verifies
-            # that scheduled() can access the configured secrets at runtime.
-            telegram_sent = await send_telegram(
-                runtime_env,
-                f"InfoTrader cron fired (DRY RUN)\nScan: {scan or 'unknown'}\nCron: {cron or 'unknown'}",
-            )
-            print(f"CRON TELEGRAM DIAGNOSTIC: sent={telegram_sent}")
-
-            try:
-                await store.record_cron(cron or "unknown", scan)
-                print("CRON HEARTBEAT: recorded")
-            except Exception as exc:
-                print(f"CRON HEARTBEAT ERROR: {type(exc).__name__}: {exc}")
-
-            if not scan:
-                print(f"CRON UNKNOWN: no scan mapped for expression={cron!r}")
-                return
-
-            print(f"CRON SCAN START: {scan}")
-            result = await self.run_scan(scan, store)
-            print(f"CRON SCAN COMPLETE: scan={scan} status={result.get('status')}")
+            await store.record_cron(cron or "unknown", scan)
+            print("CRON HEARTBEAT RECORDED")
         except Exception as exc:
-            import traceback
-            print(f"CRON FATAL ERROR: {type(exc).__name__}: {exc}")
-            print(traceback.format_exc())
+            print(f"CRON HEARTBEAT ERROR: {type(exc).__name__}: {exc}")
+
+        if not scan:
+            print(f"CRON UNKNOWN: no scan mapped for expression={cron!r}")
+            return
+
+        try:
+            result = await self.run_scan(scan, store)
+            print(f"CRON COMPLETE: scan={scan} status={result.get('status')}")
+        except Exception as exc:
+            print(f"SCHEDULE ERROR: scan={scan}: {type(exc).__name__}: {exc}")
+            await send_telegram(
+                env,
+                f"InfoTrader scheduled scan error\nType: {type(exc).__name__}\nError: {exc}",
+            )
 
     def _has_gemini(self) -> bool:
         for name in (
@@ -217,11 +217,13 @@ class Default(WorkerEntrypoint):
                 return await store.record_scan(scan, "paused", {})
             payload = await self.scan_polymarket(store) if scan == "polymarket" else await self.scan_crypto(store)
             event = await store.record_scan(scan, "ok", payload)
-            await send_telegram(self.env, self.format_alert(scan, payload))
+            telegram_sent = await send_telegram(self.env, self.format_alert(scan, payload))
+            print(f"SCAN TELEGRAM: sent={telegram_sent}")
             return event
         except Exception as exc:
             event = await self._record_scan_error(store, scan, exc)
-            await send_telegram(self.env, f"InfoTrader {scan} scan error: {event['payload']['error']}")
+            telegram_sent = await send_telegram(self.env, f"InfoTrader {scan} scan error\nError: {event['payload']['error']}")
+            print(f"SCAN TELEGRAM ERROR ALERT: sent={telegram_sent}")
             return event
 
     async def scan_polymarket(self, store: StateStore) -> dict:
@@ -283,14 +285,17 @@ class Default(WorkerEntrypoint):
 
     async def scan_crypto(self, store: StateStore) -> dict:
         headlines: list[dict] = []
+        news_errors: list[str] = []
         seen: set[str] = set()
         for query in NEWS_QUERIES:
             response = await fetch(f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en")
-            if response.ok:
-                for item in _rss_items(await response.text(), 4):
-                    if item["link"] and item["link"] not in seen:
-                        seen.add(item["link"])
-                        headlines.append(item)
+            if not response.ok:
+                news_errors.append(f"{query}: HTTP {response.status}")
+                continue
+            for item in _rss_items(await response.text(), 4):
+                if item["link"] and item["link"] not in seen:
+                    seen.add(item["link"])
+                    headlines.append(item)
 
         boosted = await fetch_json(DEX_BOOSTS_URL)
         pairs = []
@@ -354,9 +359,12 @@ class Default(WorkerEntrypoint):
         return {
             "source": "Google News + DexScreener + OpenSea + Gemini",
             "headlines": headlines[:12],
+            "news_errors": news_errors,
             "tickers": sorted({ticker for row in headlines for ticker in extract_tickers(row["title"])}),
             "liquid_pairs": sorted(pairs, key=lambda pair: pair["liquidity_usd"], reverse=True)[:10],
             "nft_collections": nfts,
+            "opensea_configured": bool(opensea_key),
+            "nft_collections_configured": bool(nft_collections),
             "research": gemini_notes,
         }
 
@@ -413,27 +421,64 @@ class Default(WorkerEntrypoint):
     @staticmethod
     def format_alert(scan: str, payload: dict) -> str:
         if scan == "polymarket":
-            picks = payload.get("selected", [])[:3]
+            picks = payload.get("selected", [])[:5]
             lines = [
                 "InfoTrader Polymarket scan (DRY RUN)",
-                f"Premier League markets: {payload.get('premier_league_markets', 0)}",
+                f"Markets scanned: {payload.get('markets_seen', 0)}",
+                f"Premier League matches: {payload.get('premier_league_markets', 0)}",
+                f"Gemini research: {len(payload.get('research', []))}",
+                f"AI decisions: {len(payload.get('decisions', []))}",
+                "",
+                "Top markets:",
             ]
-            lines.extend(
-                f"- {item.get('question')} | liq ${item.get('liquidity', 0):,.0f}"
-                for item in picks
-            )
+            for item in picks:
+                prices = item.get("outcome_prices") or []
+                price_text = ", ".join(
+                    f"{item.get('outcomes', [])[i] if i < len(item.get('outcomes', [])) else 'Outcome'} {float(prices[i]):.1%}"
+                    for i in range(min(len(prices), len(item.get("outcomes") or [])))
+                    if str(prices[i]).replace('.', '', 1).isdigit()
+                )
+                lines.append(
+                    f"• {item.get('question') or item.get('slug')}\n"
+                    f"  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}"
+                    + (f"\n  Prices: {price_text}" if price_text else "")
+                )
             decisions = payload.get("decisions", [])
-            for item in decisions[:3]:
-                result = item.get("result") if isinstance(item.get("result"), dict) else item
-                text = result.get("text") if isinstance(result, dict) else None
-                if text:
-                    lines.append(f"Decision for {item.get('subject')}: {text[:700]}")
+            if decisions:
+                lines.extend(["", "AI decisions:"])
+                for item in decisions[:3]:
+                    result = item.get("result") if isinstance(item.get("result"), dict) else item
+                    text = result.get("text") if isinstance(result, dict) else None
+                    if text:
+                        lines.append(f"• {item.get('subject')}: {text[:900]}")
             return "\n".join(lines)
+
+        pairs = payload.get("liquid_pairs", [])[:5]
         lines = [
-            "InfoTrader crypto scan",
+            "InfoTrader crypto scan (DRY RUN)",
             f"Robinhood headlines: {len(payload.get('headlines', []))}",
             f"Liquid pairs: {len(payload.get('liquid_pairs', []))}",
-            f"OpenSea NFT collections: {len(payload.get('nft_collections', []))}",
+            f"Tickers detected: {', '.join(payload.get('tickers', [])[:8]) or 'none'}",
+            f"OpenSea API: {'configured' if payload.get('opensea_configured') else 'not configured'}",
+            f"NFT collections watched: {len(payload.get('nft_collections', []))}",
         ]
-        lines.extend(f"- {row.get('title')}" for row in payload.get("headlines", [])[:3])
+        news_errors = payload.get("news_errors", [])
+        if news_errors:
+            lines.append(f"News feed errors: {len(news_errors)}")
+        if pairs:
+            lines.extend(["", "Top liquid pairs:"])
+            for pair in pairs:
+                lines.append(
+                    f"• {pair.get('symbol') or '?'} on {pair.get('dex') or '?'} ({pair.get('chain') or '?'}) "
+                    f"liq ${pair.get('liquidity_usd', 0):,.0f} | 24h ${pair.get('volume_24h_usd', 0):,.0f}"
+                )
+        headlines = payload.get("headlines", [])
+        if headlines:
+            lines.extend(["", "Latest headlines:"])
+            lines.extend(f"• {row.get('title')}" for row in headlines[:5])
+        research = payload.get("research")
+        if isinstance(research, dict) and research.get("text"):
+            lines.extend(["", "AI assessment:", research["text"][:1200]])
+        elif isinstance(research, dict) and research.get("error"):
+            lines.extend(["", f"AI assessment error: {research['error']}"])
         return "\n".join(lines)
