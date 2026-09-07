@@ -93,6 +93,39 @@ Other commands:
 
 The original crypto monitor remains in the repository and is still used by the `meme-monitor` service. It fetches Robinhood-specific crypto news, extracts explicit token symbols, cross-checks those symbols against DexScreener liquidity/volume, scans liquid/trending pairs, and optionally queries Reservoir for configured NFT collections. Signals are persisted to the shared state volume and sent to Telegram.
 
+## Cloudflare Workers scheduled scanner
+
+The `cloudflare/` project is a Worker-native, **dry-run-only** scanner. It does not import the Docker services, use local files, or execute trades. It uses Cloudflare's asynchronous `fetch` API and has two UTC Cron Triggers:
+
+| Schedule | Scanner | What it records |
+|---|---|---|
+| `*/15 * * * *` | Polymarket / Premier League | Active Premier League markets plus liquidity, volume, outcomes, and the selected priority list |
+| `0 * * * *` | Crypto intelligence | Robinhood-related headlines, extracted tickers, liquid DexScreener boosted pairs, and the optional Reservoir NFT watchlist |
+
+The Worker needs an `INFOTRADER_STATE` Cloudflare KV binding before scheduled scans are allowed to run. This intentionally fails closed: without persistence, the Worker will not send unrecorded alerts or risk duplicate scans. KV stores the most recent scan timestamp/payload, a bounded history of 30 signals, and persistent `PAUSED` / `STOP` flags.
+
+Create a KV namespace named `infotrader-state` in the Cloudflare dashboard. Copy the `kv_namespaces` entry from [`cloudflare/wrangler.state.example.jsonc`](cloudflare/wrangler.state.example.jsonc) into `cloudflare/wrangler.jsonc`, replacing the placeholder with the namespace ID, then redeploy. Alternatively add the same binding in the Worker dashboard with binding name exactly `INFOTRADER_STATE`.
+
+Set these Worker **secrets** in the Cloudflare dashboard (never commit them):
+
+```text
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+CONTROL_TOKEN
+RESERVOIR_API_KEY              # only for NFT collection scans
+```
+
+Set these non-secret Worker variables if wanted:
+
+```text
+MIN_LIQUIDITY_USD=5000
+NFT_COLLECTIONS=azuki,pudgypenguins
+```
+
+`/health` and `/status` are safe read-only endpoints. The following `POST` routes need an `Authorization: Bearer <CONTROL_TOKEN>` header: `/control/pause`, `/control/resume`, `/control/stop`, `/scan/polymarket`, and `/scan/crypto`. `STOP` and `PAUSED` both suppress scheduled scans; `/resume` clears both. These controls never enable order placement.
+
+After a deployment, Cron Trigger changes can take several minutes to propagate. All schedules use UTC.
+
 ## OCI deployment
 
 Create an Ubuntu Ampere A1 Flex VM in your OCI home region and use `ops/cloud-init.yaml`.

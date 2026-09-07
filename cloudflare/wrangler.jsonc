@@ -3,5 +3,11 @@
   "name": "infotrader",
   "main": "src/entry.py",
   "compatibility_date": "2026-09-07",
-  "compatibility_flags": ["python_workers"]
+  "compatibility_flags": ["python_workers"],
+  "triggers": {
+    "crons": [
+      "*/15 * * * *",
+      "0 * * * *"
+    ]
+  }
 }
