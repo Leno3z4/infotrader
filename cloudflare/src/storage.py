@@ -67,6 +67,16 @@ class StateStore:
         """
         await self.put_json(self._event_key(prefix), event)
 
+    async def record_cron(self, cron: str, scan: str | None) -> dict[str, Any]:
+        event = {
+            "cron": cron,
+            "scan": scan,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        await self.put_json("cron:last", event)
+        await self._record_event("recent:cron", event)
+        return event
+
     async def record_scan(self, scan: str, status: str, payload: dict[str, Any]) -> dict[str, Any]:
         event = {
             "scan": scan,
@@ -117,8 +127,10 @@ class StateStore:
             "storage_bound": self.available,
             "paused": await self.flag("PAUSED"),
             "stopped": await self.flag("STOP"),
+            "cron": await self.get_json("cron:last"),
             "polymarket": await self.get_json("scan:polymarket:last"),
             "crypto": await self.get_json("scan:crypto:last"),
+            "recent_cron": await self.recent("recent:cron", 5),
             "recent_research": await self.recent("recent:research", 5),
             "recent_decisions": await self.recent("recent:decisions", 5),
         }
