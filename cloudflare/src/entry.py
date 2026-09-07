@@ -77,7 +77,22 @@ class Default(WorkerEntrypoint):
                 "opensea_configured": bool(getattr(self.env, "OPENSEA_API_KEY", None)),
             })
         if path == "/status":
-            return Response.json({"service": "infotrader", "dry_run": True, **(await store.status())})
+            try:
+                status = await store.status()
+                return Response.json({"service": "infotrader", "dry_run": True, **status})
+            except Exception as exc:
+                import traceback
+                error_type = type(exc).__name__
+                error_message = str(exc)
+                print(f"STATUS ERROR: {error_type}: {error_message}")
+                print(traceback.format_exc())
+                return Response.json({
+                    "ok": False,
+                    "service": "infotrader",
+                    "dry_run": True,
+                    "error": error_type,
+                    "message": error_message,
+                }, status=500)
         if path.startswith("/control/") or path.startswith("/scan/"):
             if request.method != "POST" or not authorized(request, self.env):
                 return Response("Not found", status=404)
