@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 
 class StateStore:
-    """Persist control flags, scan state, research and decision history.
-
-    The binding is optional for deployment, but scheduled scans fail closed until
-    it is attached so the Worker never produces untracked runs.
-    """
+    """Persist control flags, scan state, research and decision history."""
 
     def __init__(self, env: Any):
         self._kv = getattr(env, "INFOTRADER_STATE", None)
@@ -56,10 +53,19 @@ class StateStore:
         else:
             await self._kv.delete(key)
 
-    async def _append(self, key: str, event: dict[str, Any], limit: int = 30) -> None:
-        recent = await self.get_json(key, [])
-        recent = [event, *recent][:limit]
-        await self.put_json(key, recent)
+    @staticmethod
+    def _event_key(prefix: str) -> str:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        return f"{prefix}:{stamp}:{uuid.uuid4().hex}"
+
+    async def _record_event(self, prefix: str, event: dict[str, Any]) -> None:
+        """Write each event to its own key to avoid read-modify-write races.
+
+        Cloudflare KV applies write limits per key, so unique event keys also
+        prevent a burst of research/decision events from repeatedly rewriting a
+        single hot history key.
+        """
+        await self.put_json(self._event_key(prefix), event)
 
     async def record_scan(self, scan: str, status: str, payload: dict[str, Any]) -> dict[str, Any]:
         event = {
@@ -69,7 +75,7 @@ class StateStore:
             "payload": payload,
         }
         await self.put_json(f"scan:{scan}:last", event)
-        await self.put_json("recent:signals", [event, *(await self.get_json("recent:signals", []))][:30])
+        await self._record_event("recent:signals", event)
         return event
 
     async def record_research(self, scan: str, subject: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -79,7 +85,7 @@ class StateStore:
             "at": datetime.now(timezone.utc).isoformat(),
             "result": result,
         }
-        await self._append("recent:research", event, 30)
+        await self._record_event("recent:research", event)
         return event
 
     async def record_decision(self, scan: str, subject: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -89,12 +95,22 @@ class StateStore:
             "at": datetime.now(timezone.utc).isoformat(),
             "result": result,
         }
-        await self._append("recent:decisions", event, 30)
+        await self._record_event("recent:decisions", event)
         return event
 
-    async def recent(self, key: str, limit: int = 10) -> list[dict[str, Any]]:
-        rows = await self.get_json(key, [])
-        return rows[:limit] if isinstance(rows, list) else []
+    async def recent(self, prefix: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Return newest events under a prefix, ordered by event-key timestamp."""
+        if not self.available:
+            return []
+        result = await self._kv.list(prefix=prefix, limit=limit)
+        keys = [row.get("name") for row in result.get("keys", []) if row.get("name")]
+        keys.sort(reverse=True)
+        events: list[dict[str, Any]] = []
+        for key in keys[:limit]:
+            value = await self.get_json(key)
+            if isinstance(value, dict):
+                events.append(value)
+        return events
 
     async def status(self) -> dict[str, Any]:
         return {
