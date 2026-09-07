@@ -9,7 +9,7 @@ import requests
 DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1"
-RESERVOIR_COLLECTION_URL = "https://api.reservoir.tools/collections/v7"
+OPENSEA_COLLECTION_STATS_URL = "https://api.opensea.io/api/v2/collections/{slug}/stats"
 HEADERS = {"User-Agent": "info-trader/1.0"}
 HTTP_TIMEOUT = 15
 
@@ -124,19 +124,26 @@ def get_robinhood_news(max_items_per_query: int = 4) -> list[dict]:
 
 
 def get_nft_collection_stats(slug: str) -> dict | None:
-    headers = dict(HEADERS)
-    api_key = os.getenv("RESERVOIR_API_KEY")
-    if api_key:
-        headers["x-api-key"] = api_key
+    """Fetch read-only collection statistics from OpenSea."""
+    api_key = os.getenv("OPENSEA_API_KEY")
+    if not api_key:
+        print("[scraper] OpenSea skipped: OPENSEA_API_KEY is not configured")
+        return None
+    url = OPENSEA_COLLECTION_STATS_URL.format(slug=requests.utils.quote(slug, safe=""))
+    headers = {**HEADERS, "x-api-key": api_key, "accept": "application/json"}
     try:
-        response = requests.get(RESERVOIR_COLLECTION_URL, params={"slug": slug}, timeout=HTTP_TIMEOUT, headers=headers)
+        response = requests.get(url, timeout=HTTP_TIMEOUT, headers=headers)
         response.raise_for_status()
-        collections = response.json().get("collections", [])
+        payload = response.json()
     except (requests.RequestException, ValueError) as exc:
-        print(f"[scraper] Reservoir failed for {slug}: {exc}")
+        print(f"[scraper] OpenSea failed for {slug}: {exc}")
         return None
-    if not collections:
-        return None
-    collection = collections[0]
-    floor = ((collection.get("floorAsk") or {}).get("price", {}).get("amount")) or {}
-    return {"slug": slug, "name": collection.get("name"), "floor_price_usd": floor.get("usd"), "volume_24h_usd": (collection.get("volume") or {}).get("1day")}
+    total = payload.get("total") or {}
+    return {
+        "slug": slug,
+        "floor_price": total.get("floor_price", total.get("floorPrice")),
+        "volume": total.get("volume"),
+        "sales": total.get("sales"),
+        "owners": total.get("num_owners", total.get("numOwners")),
+        "source": "OpenSea",
+    }
