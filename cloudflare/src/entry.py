@@ -78,6 +78,7 @@ class Default(WorkerEntrypoint):
                 "dry_run": True,
                 "storage_bound": store.available,
                 "gemini_configured": self._has_gemini(),
+                "telegram_configured": self._has_telegram(),
                 "opensea_configured": bool(getattr(self.env, "OPENSEA_API_KEY", None)),
             })
         if path == "/status":
@@ -132,11 +133,20 @@ class Default(WorkerEntrypoint):
         if not store.available:
             print("CRON STORAGE MISSING: INFOTRADER_STATE is not configured; scheduled scan skipped")
             return
+
+        # Telegram is an independent diagnostic channel. Failure here must never
+        # prevent the actual scheduled scan from running.
+        await send_telegram(
+            env,
+            f"InfoTrader cron fired (DRY RUN)\nScan: {scan or 'unknown'}\nCron: {cron or 'unknown'}",
+        )
+
+        # Heartbeat is useful telemetry, but must never gate execution of the scan.
         try:
             await store.record_cron(cron or "unknown", scan)
         except Exception as exc:
             print(f"CRON HEARTBEAT ERROR: {type(exc).__name__}: {exc}")
-            return
+
         if not scan:
             print(f"CRON UNKNOWN: no scan mapped for expression={cron!r}")
             return
@@ -154,6 +164,12 @@ class Default(WorkerEntrypoint):
             if getattr(self.env, name, None):
                 return True
         return False
+
+    def _has_telegram(self) -> bool:
+        return bool(
+            getattr(self.env, "TELEGRAM_BOT_TOKEN", None)
+            and getattr(self.env, "TELEGRAM_CHAT_ID", None)
+        )
 
     async def _record_scan_error(self, store: StateStore, scan: str, exc: Exception) -> dict:
         payload = {"error": f"{type(exc).__name__}: {exc}"}
