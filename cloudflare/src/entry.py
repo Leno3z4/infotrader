@@ -1,20 +1,27 @@
-"""InfoTrader's Cloudflare Worker-native, dry-run-only scanner."""
+"""InfoTrader Cloudflare Worker: scheduled intelligence pipeline, dry-run only."""
 
 from __future__ import annotations
 
 import json
+import re
 from urllib.parse import quote, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
+from gemini import GeminiRotator
 from scanner_helpers import extract_tickers, normalize_market, priority_score, safe_float
 from storage import StateStore
 
 POLYMARKET_CRON = "*/15 * * * *"
 CRYPTO_CRON = "0 * * * *"
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&search=Premier%20League"
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100"
 DEX_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
-NEWS_QUERIES = ("Robinhood crypto token listing", "Robinhood meme coin", "Robinhood mint token crypto")
+NEWS_QUERIES = (
+    "Robinhood crypto token listing",
+    "Robinhood meme coin",
+    "Robinhood mint token crypto",
+)
+OPENSEA_BASE = "https://api.opensea.io/api/v2"
 
 
 async def fetch_json(url: str, **options):
@@ -25,20 +32,21 @@ async def fetch_json(url: str, **options):
 
 
 def _rss_items(xml: str, limit: int) -> list[dict]:
-    # Google News RSS entries are XML; only title/link are required for a signal.
-    import re
-
-    items = []
+    items: list[dict] = []
     for block in re.findall(r"<item>(.*?)</item>", xml, flags=re.DOTALL)[:limit]:
         title = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", block, re.DOTALL)
         link = re.search(r"<link>(.*?)</link>", block, re.DOTALL)
         if title:
-            items.append({"title": (title.group(1) or title.group(2) or "").strip(), "link": (link.group(1).strip() if link else "")})
+            items.append({
+                "title": (title.group(1) or title.group(2) or "").strip(),
+                "link": (link.group(1).strip() if link else ""),
+            })
     return items
 
 
 async def send_telegram(env, message: str) -> bool:
-    token, chat_id = getattr(env, "TELEGRAM_BOT_TOKEN", None), getattr(env, "TELEGRAM_CHAT_ID", None)
+    token = getattr(env, "TELEGRAM_BOT_TOKEN", None)
+    chat_id = getattr(env, "TELEGRAM_CHAT_ID", None)
     if not token or not chat_id:
         return False
     response = await fetch(
@@ -59,9 +67,15 @@ class Default(WorkerEntrypoint):
     async def fetch(self, request):
         path = urlparse(request.url).path
         store = StateStore(self.env)
-
         if path == "/health":
-            return Response.json({"ok": True, "service": "infotrader", "dry_run": True, "storage_bound": store.available})
+            return Response.json({
+                "ok": True,
+                "service": "infotrader",
+                "dry_run": True,
+                "storage_bound": store.available,
+                "gemini_configured": self._has_gemini(),
+                "opensea_configured": bool(getattr(self.env, "OPENSEA_API_KEY", None)),
+            })
         if path == "/status":
             return Response.json({"service": "infotrader", "dry_run": True, **(await store.status())})
         if path.startswith("/control/") or path.startswith("/scan/"):
@@ -84,7 +98,12 @@ class Default(WorkerEntrypoint):
                 return Response("Not found", status=404)
             return Response.json(await store.status())
 
-        return Response.json({"service": "infotrader", "status": "online", "dry_run": True, "endpoints": ["/health", "/status"]})
+        return Response.json({
+            "service": "infotrader",
+            "status": "online",
+            "dry_run": True,
+            "endpoints": ["/health", "/status"],
+        })
 
     async def scheduled(self, controller, env, ctx):
         store = StateStore(env)
@@ -95,13 +114,22 @@ class Default(WorkerEntrypoint):
         if scan:
             await self.run_scan(scan, store)
 
+    def _has_gemini(self) -> bool:
+        for name in (
+            "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3",
+            "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEY",
+        ):
+            if getattr(self.env, name, None):
+                return True
+        return False
+
     async def run_scan(self, scan: str, store: StateStore) -> dict:
         if await store.flag("STOP"):
             return await store.record_scan(scan, "stopped", {})
         if await store.flag("PAUSED"):
             return await store.record_scan(scan, "paused", {})
         try:
-            payload = await self.scan_polymarket() if scan == "polymarket" else await self.scan_crypto()
+            payload = await self.scan_polymarket(store) if scan == "polymarket" else await self.scan_crypto(store)
             event = await store.record_scan(scan, "ok", payload)
             await send_telegram(self.env, self.format_alert(scan, payload))
             return event
@@ -110,14 +138,58 @@ class Default(WorkerEntrypoint):
             await send_telegram(self.env, f"InfoTrader {scan} scan error: {event['payload']['error']}")
             return event
 
-    async def scan_polymarket(self) -> dict:
+    async def scan_polymarket(self, store: StateStore) -> dict:
         raw = await fetch_json(GAMMA_MARKETS_URL)
         rows = raw if isinstance(raw, list) else raw.get("markets", [])
-        markets = sorted((normalize_market(row) for row in rows if isinstance(row, dict)), key=priority_score, reverse=True)
-        selected = markets[:8]
-        return {"source": "Polymarket Gamma", "markets_seen": len(markets), "premier_league_markets": sum(m["premier_league"] for m in markets), "selected": selected}
+        markets = sorted(
+            (normalize_market(row) for row in rows if isinstance(row, dict)),
+            key=priority_score,
+            reverse=True,
+        )
+        max_markets = int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8"))
+        selected = markets[:max_markets]
 
-    async def scan_crypto(self) -> dict:
+        research_results = []
+        decisions = []
+        research_client = None
+        decision_client = None
+        if self._has_gemini():
+            try:
+                research_client = GeminiRotator(self.env, "RESEARCH")
+                decision_client = GeminiRotator(self.env, "DECISION")
+            except Exception as exc:
+                research_results.append({"error": f"Gemini unavailable: {exc}"})
+
+        for market in selected[: min(3, len(selected))]:
+            subject = market.get("question") or market.get("slug") or "unknown market"
+            research = None
+            if research_client:
+                query = self._research_prompt(market)
+                try:
+                    research = await research_client.research(query)
+                    research_results.append({"subject": subject, **research})
+                    await store.record_research("polymarket", subject, research)
+                except Exception as exc:
+                    research_results.append({"subject": subject, "error": f"{type(exc).__name__}: {exc}"})
+            if decision_client and research and research.get("text"):
+                try:
+                    decision = await decision_client.decide(self._decision_prompt(market, research))
+                    decisions.append({"subject": subject, **decision})
+                    await store.record_decision("polymarket", subject, decision)
+                except Exception as exc:
+                    decisions.append({"subject": subject, "error": f"{type(exc).__name__}: {exc}"})
+
+        return {
+            "source": "Polymarket Gamma + Gemini",
+            "markets_seen": len(markets),
+            "premier_league_markets": sum(m["premier_league"] for m in markets),
+            "selected": selected,
+            "research": research_results,
+            "decisions": decisions,
+            "live_execution": False,
+        }
+
+    async def scan_crypto(self, store: StateStore) -> dict:
         headlines: list[dict] = []
         seen: set[str] = set()
         for query in NEWS_QUERIES:
@@ -127,6 +199,7 @@ class Default(WorkerEntrypoint):
                     if item["link"] and item["link"] not in seen:
                         seen.add(item["link"])
                         headlines.append(item)
+
         boosted = await fetch_json(DEX_BOOSTS_URL)
         pairs = []
         for token in list(boosted or [])[:10]:
@@ -139,30 +212,130 @@ class Default(WorkerEntrypoint):
             for pair in list(raw_pairs or [])[:2]:
                 liquidity = safe_float(((pair.get("liquidity") or {}).get("usd")))
                 if liquidity >= float(getattr(self.env, "MIN_LIQUIDITY_USD", "5000")):
-                    pairs.append({"symbol": (pair.get("baseToken") or {}).get("symbol"), "chain": pair.get("chainId"), "dex": pair.get("dexId"), "liquidity_usd": liquidity, "volume_24h_usd": safe_float(((pair.get("volume") or {}).get("h24"))), "url": pair.get("url")})
+                    pairs.append({
+                        "symbol": (pair.get("baseToken") or {}).get("symbol"),
+                        "chain": pair.get("chainId"),
+                        "dex": pair.get("dexId"),
+                        "liquidity_usd": liquidity,
+                        "volume_24h_usd": safe_float(((pair.get("volume") or {}).get("h24"))),
+                        "url": pair.get("url"),
+                    })
+
         nft_collections = [slug.strip() for slug in str(getattr(self.env, "NFT_COLLECTIONS", "")).split(",") if slug.strip()][:5]
         nfts = []
+        opensea_key = getattr(self.env, "OPENSEA_API_KEY", None)
         for slug in nft_collections:
-            headers = {"User-Agent": "infotrader-cloudflare/1.0"}
-            reservoir_key = getattr(self.env, "RESERVOIR_API_KEY", None)
-            if reservoir_key:
-                headers["x-api-key"] = reservoir_key
-            response = await fetch(f"https://api.reservoir.tools/collections/v7?slug={quote(slug)}", headers=headers)
+            if not opensea_key:
+                break
+            response = await fetch(
+                f"{OPENSEA_BASE}/collections/{quote(slug)}/stats",
+                headers={"x-api-key": opensea_key, "accept": "application/json"},
+            )
             if not response.ok:
                 continue
-            collections = (await response.json()).get("collections", [])
-            if collections:
-                collection = collections[0]
-                nfts.append({"slug": slug, "name": collection.get("name"), "floor_price_usd": (((collection.get("floorAsk") or {}).get("price") or {}).get("amount") or {}).get("usd"), "volume_24h_usd": (collection.get("volume") or {}).get("1day")})
-        return {"source": "Google News + DexScreener + Reservoir", "headlines": headlines[:12], "tickers": sorted({ticker for row in headlines for ticker in extract_tickers(row["title"])}), "liquid_pairs": sorted(pairs, key=lambda pair: pair["liquidity_usd"], reverse=True)[:10], "nft_collections": nfts}
+            stats = await response.json()
+            total = stats.get("total") or {}
+            nfts.append({
+                "slug": slug,
+                "floor_price": total.get("floor_price"),
+                "volume": total.get("volume"),
+                "sales": total.get("sales"),
+                "owners": total.get("num_owners"),
+                "source": "OpenSea",
+            })
+
+        gemini_notes = None
+        if self._has_gemini() and (headlines or pairs):
+            try:
+                client = GeminiRotator(self.env, "RESEARCH")
+                gemini_notes = await client.research(self._crypto_research_prompt(headlines, pairs, nfts))
+                await store.record_research("crypto", "Robinhood/crypto intelligence", gemini_notes)
+            except Exception as exc:
+                gemini_notes = {"error": f"{type(exc).__name__}: {exc}"}
+
+        return {
+            "source": "Google News + DexScreener + OpenSea + Gemini",
+            "headlines": headlines[:12],
+            "tickers": sorted({ticker for row in headlines for ticker in extract_tickers(row["title"])}),
+            "liquid_pairs": sorted(pairs, key=lambda pair: pair["liquidity_usd"], reverse=True)[:10],
+            "nft_collections": nfts,
+            "research": gemini_notes,
+        }
+
+    @staticmethod
+    def _research_prompt(market: dict) -> str:
+        return json.dumps({
+            "task": "Research this Polymarket market using current web information.",
+            "market": market,
+            "requirements": [
+                "Find the most decision-relevant recent facts.",
+                "For Premier League markets, prioritize official Premier League/team sources plus reputable sports reporting.",
+                "Check injuries, suspensions, lineup/team news, form, table position and xG when relevant.",
+                "State what is known, what is uncertain, and the publication dates of important facts.",
+                "Do not fabricate odds, sources, injuries, or events.",
+            ],
+        })
+
+    @staticmethod
+    def _decision_prompt(market: dict, research: dict) -> str:
+        return json.dumps({
+            "task": "Evaluate this prediction market. Return JSON only.",
+            "market": market,
+            "research": research,
+            "output_schema": {
+                "action": "BUY_YES | BUY_NO | PASS",
+                "outcome": "exact outcome label from the market, or empty string",
+                "fair_probability": "number between 0 and 1",
+                "market_probability": "number between 0 and 1 when available",
+                "edge": "fair_probability - market_probability for the selected outcome, or 0",
+                "confidence": "number between 0 and 1",
+                "reason": "concise evidence-based explanation",
+            },
+            "rules": [
+                "PASS when evidence is insufficient or edge is not meaningful.",
+                "Never claim that an order was placed.",
+            ],
+        })
+
+    @staticmethod
+    def _crypto_research_prompt(headlines: list[dict], pairs: list[dict], nfts: list[dict]) -> str:
+        return json.dumps({
+            "task": "Assess current crypto intelligence for potential material developments.",
+            "headlines": headlines[:10],
+            "liquid_pairs": pairs[:10],
+            "nft_collections": nfts[:5],
+            "requirements": [
+                "Focus on Robinhood-related listings/mints and material meme-coin developments.",
+                "Distinguish confirmed announcements from speculation.",
+                "Highlight symbols or developments worth monitoring next cycle.",
+                "Use current web sources and dates; do not invent facts.",
+            ],
+        })
 
     @staticmethod
     def format_alert(scan: str, payload: dict) -> str:
         if scan == "polymarket":
             picks = payload.get("selected", [])[:3]
-            lines = ["InfoTrader Polymarket scan (DRY RUN)", f"Premier League markets: {payload.get('premier_league_markets', 0)}"]
-            lines.extend(f"- {item.get('question')} | liq ${item.get('liquidity', 0):,.0f}" for item in picks)
+            lines = [
+                "InfoTrader Polymarket scan (DRY RUN)",
+                f"Premier League markets: {payload.get('premier_league_markets', 0)}",
+            ]
+            lines.extend(
+                f"- {item.get('question')} | liq ${item.get('liquidity', 0):,.0f}"
+                for item in picks
+            )
+            decisions = payload.get("decisions", [])
+            for item in decisions[:3]:
+                result = item.get("result") if isinstance(item.get("result"), dict) else item
+                text = result.get("text") if isinstance(result, dict) else None
+                if text:
+                    lines.append(f"Decision for {item.get('subject')}: {text[:700]}")
             return "\n".join(lines)
-        lines = ["InfoTrader crypto scan", f"Robinhood headlines: {len(payload.get('headlines', []))}", f"Liquid pairs: {len(payload.get('liquid_pairs', []))}"]
+        lines = [
+            "InfoTrader crypto scan",
+            f"Robinhood headlines: {len(payload.get('headlines', []))}",
+            f"Liquid pairs: {len(payload.get('liquid_pairs', []))}",
+            f"OpenSea NFT collections: {len(payload.get('nft_collections', []))}",
+        ]
         lines.extend(f"- {row.get('title')}" for row in payload.get("headlines", [])[:3])
         return "\n".join(lines)
