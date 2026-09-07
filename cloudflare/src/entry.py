@@ -48,6 +48,7 @@ async def send_telegram(env, message: str) -> bool:
     token = getattr(env, "TELEGRAM_BOT_TOKEN", None)
     chat_id = getattr(env, "TELEGRAM_CHAT_ID", None)
     if not token or not chat_id:
+        print("TELEGRAM NOT CONFIGURED")
         return False
     try:
         response = await fetch(
@@ -56,7 +57,11 @@ async def send_telegram(env, message: str) -> bool:
             headers={"content-type": "application/json"},
             body=json.dumps({"chat_id": chat_id, "text": message[:4000]}),
         )
-        return bool(response.ok)
+        if not response.ok:
+            print(f"TELEGRAM HTTP ERROR: status={response.status}")
+            return False
+        print("TELEGRAM SENT")
+        return True
     except Exception as exc:
         print(f"TELEGRAM ERROR: {type(exc).__name__}: {exc}")
         return False
@@ -126,35 +131,60 @@ class Default(WorkerEntrypoint):
         })
 
     async def scheduled(self, controller, env, ctx):
-        store = StateStore(env)
+        """Handle Cloudflare Cron Triggers with explicit execution diagnostics."""
+        print("CRON HANDLER ENTERED")
         cron = getattr(controller, "cron", None)
-        scan = POLYMARKET_CRON if cron == POLYMARKET_CRON else CRYPTO_CRON if cron == CRYPTO_CRON else None
-        print(f"CRON FIRED: expression={cron!r} scan={scan!r}")
+        print(f"CRON CONTROLLER: {cron!r}")
+
+        store = StateStore(env)
+        print(f"CRON STORAGE AVAILABLE: {store.available}")
+
+        scan = (
+            POLYMARKET_CRON
+            if cron == POLYMARKET_CRON
+            else CRYPTO_CRON
+            if cron == CRYPTO_CRON
+            else None
+        )
+        print(f"CRON DISPATCH: scan={scan!r}")
+
+        # This notification is deliberately first: it proves the Python scheduled
+        # handler body was entered. A Telegram problem must never block the scan.
+        try:
+            sent = await send_telegram(
+                env,
+                "InfoTrader cron fired (DRY RUN)\n"
+                f"Scan: {scan or 'unknown'}\n"
+                f"Cron: {cron or 'unknown'}",
+            )
+            print(f"CRON TELEGRAM DIAGNOSTIC: sent={sent}")
+        except Exception as exc:
+            print(f"CRON TELEGRAM DIAGNOSTIC ERROR: {type(exc).__name__}: {exc}")
+
         if not store.available:
             print("CRON STORAGE MISSING: INFOTRADER_STATE is not configured; scheduled scan skipped")
             return
 
-        # Telegram is an independent diagnostic channel. Failure here must never
-        # prevent the actual scheduled scan from running.
-        await send_telegram(
-            env,
-            f"InfoTrader cron fired (DRY RUN)\nScan: {scan or 'unknown'}\nCron: {cron or 'unknown'}",
-        )
-
-        # Heartbeat is useful telemetry, but must never gate execution of the scan.
+        # Heartbeat is telemetry only and can never prevent scan execution.
         try:
             await store.record_cron(cron or "unknown", scan)
+            print("CRON HEARTBEAT RECORDED")
         except Exception as exc:
             print(f"CRON HEARTBEAT ERROR: {type(exc).__name__}: {exc}")
 
         if not scan:
             print(f"CRON UNKNOWN: no scan mapped for expression={cron!r}")
             return
+
         try:
             result = await self.run_scan(scan, store)
             print(f"CRON COMPLETE: scan={scan} status={result.get('status')}")
         except Exception as exc:
             print(f"SCHEDULE ERROR: scan={scan}: {type(exc).__name__}: {exc}")
+            await send_telegram(
+                env,
+                f"InfoTrader scheduled scan error: {type(exc).__name__}: {exc}",
+            )
 
     def _has_gemini(self) -> bool:
         for name in (
