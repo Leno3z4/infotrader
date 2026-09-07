@@ -1,4 +1,4 @@
-"""Small persistence abstraction over the optional Cloudflare KV binding."""
+"""Persistence abstraction over the Cloudflare KV binding."""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ from typing import Any
 
 
 class StateStore:
-    """Persist control flags and bounded scanner history in ``INFOTRADER_STATE``.
+    """Persist control flags, scan state, research and decision history.
 
-    The binding is optional at deploy time so the health Worker stays deployable
-    before the user creates the KV namespace. Scheduled scans fail closed until
-    it is attached, avoiding unrecorded duplicate alert runs.
+    The binding is optional for deployment, but scheduled scans fail closed until
+    it is attached so the Worker never produces untracked runs.
     """
 
     def __init__(self, env: Any):
@@ -33,10 +32,15 @@ class StateStore:
         except (TypeError, json.JSONDecodeError):
             return default
 
-    async def put_json(self, key: str, value: Any) -> None:
+    async def put_json(self, key: str, value: Any, *, expiration_ttl: int | None = None) -> None:
         if not self.available:
             raise RuntimeError("INFOTRADER_STATE KV binding is not configured")
-        await self._kv.put(key, json.dumps(value, separators=(",", ":"), default=str))
+        options = {"expiration_ttl": expiration_ttl} if expiration_ttl else None
+        encoded = json.dumps(value, separators=(",", ":"), default=str)
+        if options:
+            await self._kv.put(key, encoded, options)
+        else:
+            await self._kv.put(key, encoded)
 
     async def flag(self, name: str) -> bool:
         if not self.available:
@@ -52,6 +56,11 @@ class StateStore:
         else:
             await self._kv.delete(key)
 
+    async def _append(self, key: str, event: dict[str, Any], limit: int = 30) -> None:
+        recent = await self.get_json(key, [])
+        recent = [event, *recent][:limit]
+        await self.put_json(key, recent)
+
     async def record_scan(self, scan: str, status: str, payload: dict[str, Any]) -> dict[str, Any]:
         event = {
             "scan": scan,
@@ -60,10 +69,32 @@ class StateStore:
             "payload": payload,
         }
         await self.put_json(f"scan:{scan}:last", event)
-        recent = await self.get_json("recent:signals", [])
-        recent = [event, *recent][:30]
-        await self.put_json("recent:signals", recent)
+        await self.put_json("recent:signals", [event, *(await self.get_json("recent:signals", []))][:30])
         return event
+
+    async def record_research(self, scan: str, subject: str, result: dict[str, Any]) -> dict[str, Any]:
+        event = {
+            "scan": scan,
+            "subject": subject,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "result": result,
+        }
+        await self._append("recent:research", event, 30)
+        return event
+
+    async def record_decision(self, scan: str, subject: str, result: dict[str, Any]) -> dict[str, Any]:
+        event = {
+            "scan": scan,
+            "subject": subject,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "result": result,
+        }
+        await self._append("recent:decisions", event, 30)
+        return event
+
+    async def recent(self, key: str, limit: int = 10) -> list[dict[str, Any]]:
+        rows = await self.get_json(key, [])
+        return rows[:limit] if isinstance(rows, list) else []
 
     async def status(self) -> dict[str, Any]:
         return {
@@ -72,4 +103,6 @@ class StateStore:
             "stopped": await self.flag("STOP"),
             "polymarket": await self.get_json("scan:polymarket:last"),
             "crypto": await self.get_json("scan:crypto:last"),
+            "recent_research": await self.recent("recent:research", 5),
+            "recent_decisions": await self.recent("recent:decisions", 5),
         }
