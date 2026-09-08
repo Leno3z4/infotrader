@@ -16,17 +16,11 @@ from scanner_helpers import normalize_market, safe_float
 from sports_context import build_context, classify_market
 
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
-# Keep discovery broad enough to cover different sports, but small enough that
-# Python Workers do not spend CPU parsing dozens of large search responses.
 SPORTS_QUERIES = (
     "Premier League", "NBA", "NFL", "MLB", "NHL", "UFC", "tennis", "cricket", "Formula 1",
 )
 WEATHER_QUERIES = ("weather", "temperature", "rain", "snow")
 SEARCH_LIMIT_PER_TYPE = 20
-
-# Live trading policy: exactly three successful trades per UTC day at most:
-# two Premier League trades and one weather trade. Other sports can still be
-# discovered/researched but are never eligible for live execution.
 DAILY_TRADE_LIMITS = {"premier_league": 2, "weather": 1}
 
 async def fetch_json(url: str, **options):
@@ -156,7 +150,6 @@ def _format_horizon(hours: float | None) -> str:
     return f"{hours / 24:.1f}d"
 
 def _trade_bucket(market: dict) -> str | None:
-    """Return the only market types allowed to consume the live trade budget."""
     question = str(market.get("question") or "").lower()
     if market.get("market_kind") == "weather":
         return "weather"
@@ -165,9 +158,7 @@ def _trade_bucket(market: dict) -> str | None:
     return None
 
 def _eligible_trade_candidates(markets: list[dict]) -> list[dict]:
-    """Rank only PL/weather opportunities, preserving the overall opportunity order."""
     return [market for market in markets if _trade_bucket(market) is not None]
-
 
 def _utc_trade_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -203,7 +194,6 @@ class Default(CryptoDefault):
                 found.extend(_search_markets(await fetch_json(url)))
             except Exception as exc:
                 print(f"POLYMARKET SEARCH ERROR: {query}: {type(exc).__name__}: {exc}")
-
         unique: dict[str, dict] = {}
         for market in found:
             if market.get("closed") or not market.get("active"):
@@ -216,14 +206,12 @@ class Default(CryptoDefault):
             market["is_event_market"] = _is_event_market(market)
             key = str(market.get("id") or market.get("condition_id") or market["question"])
             unique[key] = market
-
         markets = list(unique.values())
         liq_max = max((math.log1p(max(0.0, safe_float(m.get("liquidity")))) for m in markets), default=1.0)
         volume_max = max((math.log1p(max(0.0, safe_float(m.get("volume_24h")))) for m in markets), default=1.0)
         for market in markets:
             market["opportunity_score"] = _market_opportunity_score(market, liq_max, volume_max)
             market["liquidity_score"] = market["opportunity_score"]
-
         max_markets = max(1, int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8")))
         short_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 0 < m["hours_to_end"] <= 72)]
         medium_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 72 < m["hours_to_end"] <= 168)]
@@ -304,19 +292,12 @@ class Default(CryptoDefault):
             bucket = _trade_bucket(market)
             if bucket is None or bucket_counts[bucket] >= DAILY_TRADE_LIMITS[bucket]:
                 continue
-            if bucket == "premier_league" and bucket_counts[bucket] >= 2:
-                continue
-            if bucket == "weather" and bucket_counts[bucket] >= 1:
-                continue
             if usage.get(bucket, 0) >= DAILY_TRADE_LIMITS[bucket]:
                 continue
             trade_selected.append(market)
             bucket_counts[bucket] += 1
             if len(trade_selected) >= 3:
                 break
-
-        # Research exactly the daily trade slots: up to 2 PL + 1 weather.
-        # Other sports remain visible in discovery but cannot consume execution slots.
         research, decisions, history_count = await self._research_and_decide(store, trade_selected)
         execution_results: list[dict] = []
         try:
