@@ -55,7 +55,6 @@ class Default(ScheduledDefault):
             except Exception as exc:
                 news_errors.append(f"{query}: {type(exc).__name__}: {exc}")
 
-        # /top can be rate-limited. Fall back to /latest, then token profiles.
         candidates: dict[str, dict] = {}
         boost_data, boost_error = await self._json(DEX_BOOSTS_TOP_URL)
         source_used = "top boosts"
@@ -69,7 +68,7 @@ class Default(ScheduledDefault):
                 continue
             chain, address = row.get("chainId"), row.get("tokenAddress")
             if chain and address:
-                candidates[f"{chain}:{address}"] = row
+                candidates[f"{str(chain).lower()}:{str(address).lower()}"] = row
 
         if not candidates:
             profile_data, profile_error = await self._json(DEX_PROFILES_URL)
@@ -80,7 +79,7 @@ class Default(ScheduledDefault):
                         continue
                     chain, address = row.get("chainId"), row.get("tokenAddress")
                     if chain and address:
-                        candidates[f"{chain}:{address}"] = row
+                        candidates[f"{str(chain).lower()}:{str(address).lower()}"] = row
             else:
                 boost_error = f"{boost_error}; profiles={profile_error}"
 
@@ -89,16 +88,14 @@ class Default(ScheduledDefault):
         max_candidates = min(40, int(getattr(self.env, "MAX_BOOST_CANDIDATES", "25")))
         max_tokens = int(getattr(self.env, "MAX_POTENTIAL_TOKENS", "10"))
 
-        by_token: dict[str, dict] = {}
-        enrichment_errors: list[str] = []
+        candidates = dict(list(candidates.items())[:max_candidates])
         grouped: dict[str, list[str]] = {}
-        for key in list(candidates)[:max_candidates]:
+        for key in candidates:
             chain, address = key.split(":", 1)
             grouped.setdefault(chain, []).append(address)
 
-        # DexScreener allows up to 30 addresses per tokens request, avoiding one
-        # request per token and materially lowering rate-limit pressure.
         pair_rows: dict[str, dict] = {}
+        enrichment_errors: list[str] = []
         for chain, addresses in grouped.items():
             for start in range(0, len(addresses), 30):
                 chunk = addresses[start:start + 30]
@@ -107,24 +104,26 @@ class Default(ScheduledDefault):
                 if error:
                     enrichment_errors.append(f"{chain}: {error}")
                     continue
-                for pair in list(data or []):
+                rows = data if isinstance(data, list) else []
+                for pair in rows:
                     if not isinstance(pair, dict):
                         continue
                     base = pair.get("baseToken") or {}
                     addr = base.get("address")
-                    if addr:
-                        key = f"{pair.get('chainId') or chain}:{addr}"
-                        current = pair_rows.get(key)
-                        if current is None or (
-                            safe_float(((pair.get("liquidity") or {}).get("usd"))),
-                            safe_float(((pair.get("volume") or {}).get("h24"))),
-                        ) > (
-                            safe_float(((current.get("liquidity") or {}).get("usd"))),
-                            safe_float(((current.get("volume") or {}).get("h24"))),
-                        ):
-                            pair_rows[key] = pair
+                    if not addr:
+                        continue
+                    key = f"{str(pair.get('chainId') or chain).lower()}:{str(addr).lower()}"
+                    current = pair_rows.get(key)
+                    pair_liq = safe_float(((pair.get("liquidity") or {}).get("usd")))
+                    pair_vol = safe_float(((pair.get("volume") or {}).get("h24")))
+                    if current is None or (pair_liq, pair_vol) > (
+                        safe_float(((current.get("liquidity") or {}).get("usd"))),
+                        safe_float(((current.get("volume") or {}).get("h24"))),
+                    ):
+                        pair_rows[key] = pair
 
-        for key, boost in candidates.items():
+        by_token: dict[str, dict] = {}
+        for key, candidate in candidates.items():
             pair = pair_rows.get(key)
             if not pair:
                 continue
@@ -139,7 +138,7 @@ class Default(ScheduledDefault):
             buys = int(safe_float(h24.get("buys")))
             sells = int(safe_float(h24.get("sells")))
             tx_count = buys + sells
-            boost_amount = safe_float(boost.get("totalAmount"))
+            boost_amount = safe_float(candidate.get("totalAmount"))
             momentum = max(-50.0, min(100.0, safe_float(changes.get("h24"))))
             buy_ratio = buys / max(1, tx_count)
             score = (
@@ -168,17 +167,17 @@ class Default(ScheduledDefault):
                 "txns_24h": {"buys": buys, "sells": sells, "total": tx_count},
                 "buy_ratio_24h": round(buy_ratio, 3),
                 "boost_amount": boost_amount,
-                "description": (boost.get("description") or "")[:300],
+                "description": (candidate.get("description") or "")[:300],
                 "websites": [x.get("url") for x in list(info.get("websites") or [])[:2] if isinstance(x, dict) and x.get("url")],
                 "socials": [x for x in list(info.get("socials") or [])[:2] if isinstance(x, dict)],
-                "pair_url": pair.get("url") or boost.get("url"),
+                "pair_url": pair.get("url") or candidate.get("url"),
                 "token_address": base.get("address"),
                 "source": "DexScreener",
             }
 
         potential_tokens = sorted(by_token.values(), key=lambda x: x["rank_score"], reverse=True)[:max_tokens]
+        enrichment_available = bool(pair_rows)
 
-        # Optional OpenSea remains isolated from the meme-coin path.
         nfts: list[dict] = []
         nft_collections = [s.strip() for s in str(getattr(self.env, "NFT_COLLECTIONS", "")).split(",") if s.strip()][:5]
         opensea_key = getattr(self.env, "OPENSEA_API_KEY", None)
@@ -219,7 +218,7 @@ class Default(ScheduledDefault):
             except Exception as exc:
                 ai_error = f"{type(exc).__name__}: {exc}"
 
-        text_report = self._build_text_report(potential_tokens, ai_text, headlines)
+        text_report = self._build_text_report(potential_tokens, ai_text, headlines, candidates, source_used, boost_error, enrichment_errors, enrichment_available)
         return {
             "source": "DexScreener + Google News + Gemini",
             "candidate_source": source_used,
@@ -237,8 +236,25 @@ class Default(ScheduledDefault):
         }
 
     @staticmethod
-    def _build_text_report(tokens: list[dict], ai_text: str, headlines: list[dict]) -> str:
-        lines = ["🔥 INFOTRADER MEME-COIN INTELLIGENCE", f"Top {len(tokens)} current candidates by on-chain quality + current information.", ""]
+    def _build_text_report(
+        tokens: list[dict],
+        ai_text: str,
+        headlines: list[dict],
+        candidates: dict[str, dict],
+        source_used: str,
+        boost_error: str | None,
+        enrichment_errors: list[str],
+        enrichment_available: bool,
+    ) -> str:
+        lines = ["🔥 INFOTRADER MEME-COIN INTELLIGENCE"]
+        if tokens:
+            lines.append(f"Top {len(tokens)} current candidates by on-chain quality + current information.")
+        elif candidates and not enrichment_available:
+            lines.append("Candidate tokens were found, but on-chain enrichment is temporarily unavailable.")
+            lines.append("This run is NOT treating the outage as evidence that there are zero candidates.")
+        else:
+            lines.append("No qualifying on-chain candidates passed the current liquidity/volume filters in this run.")
+        lines.append("")
         for i, t in enumerate(tokens, 1):
             lines.append(
                 f"{i}. {t.get('name')} (${t.get('symbol')}) — {t.get('chain')} / {t.get('dex')}\n"
@@ -251,6 +267,10 @@ class Default(ScheduledDefault):
         if headlines:
             lines.extend(["", "📰 RECENT CRYPTO / MEME-COIN NEWS"])
             lines.extend(f"• {h.get('title')}" for h in headlines[:5])
+        diagnostics = [x for x in [boost_error] if x] + enrichment_errors[:3]
+        if diagnostics:
+            lines.extend(["", f"⚠️ DATA NOTES ({source_used})"])
+            lines.extend(f"• {x}" for x in diagnostics)
         return "\n".join(lines)[:3900]
 
     @staticmethod
