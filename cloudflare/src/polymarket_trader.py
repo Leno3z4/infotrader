@@ -34,7 +34,9 @@ class PolymarketTrader:
         self.live_requested = requested_live
         self.executor_url = str(getattr(env, "POLYMARKET_EXECUTOR_URL", "")).strip().rstrip("/")
         self.executor_token = getattr(env, "POLYMARKET_EXECUTOR_TOKEN", None)
-        self.live = bool(requested_live and self.executor_url and self.executor_token)
+        # Live trading is deliberately hard-disabled in this deployment. Keep the
+        # requested value for diagnostics, but never allow it to reach the executor.
+        self.live = False
         self.enabled = bool(
             getattr(env, "POLYMARKET_PRIVATE_KEY", None)
             and getattr(env, "POLYMARKET_WALLET_ADDRESS", None)
@@ -114,11 +116,11 @@ class PolymarketTrader:
             "live": self.live,
         }
         if not self.live:
-            reason = "live trading requested but executor is not configured" if self.live_requested else "dry-run: live trading disabled"
+            reason = "live trading requested but hard-disabled" if self.live_requested else "dry-run: live trading disabled"
             return {
                 "executed": False, "live": False, "simulated": True, "action": action, "outcome": outcome,
                 "price": price, "size": round(size, 4), "amount_usd": round(size * price, 2), "reason": reason,
-                "next_step": "Set POLYMARKET_EXECUTOR_URL and POLYMARKET_EXECUTOR_TOKEN, then deploy the JS executor separately before enabling live trading.",
+                "next_step": "Live trading remains disabled in this deployment; remove the hard-disable only when intentionally enabling live execution.",
             }
         try:
             from workers import fetch
