@@ -24,10 +24,16 @@ SPORTS_QUERIES = (
 WEATHER_QUERIES = ("weather", "temperature", "rain", "snow")
 SEARCH_LIMIT_PER_TYPE = 20
 
+# Live trading policy: exactly three successful trades per UTC day at most:
+# two Premier League trades and one weather trade. Other sports can still be
+# discovered/researched but are never eligible for live execution.
+DAILY_TRADE_LIMITS = {"premier_league": 2, "weather": 1}
+
 async def fetch_json(url: str, **options):
     response = await fetch(url, **options)
     if not response.ok:
         raise RuntimeError(f"upstream HTTP {response.status} for {url}")
+    return await response.json()
 
 def _search_markets(payload: object) -> list[dict]:
     rows: list[dict] = []
@@ -149,6 +155,45 @@ def _format_horizon(hours: float | None) -> str:
         return f"{hours:.0f}h"
     return f"{hours / 24:.1f}d"
 
+def _trade_bucket(market: dict) -> str | None:
+    """Return the only market types allowed to consume the live trade budget."""
+    question = str(market.get("question") or "").lower()
+    if market.get("market_kind") == "weather":
+        return "weather"
+    if market.get("premier_league") or "premier league" in question:
+        return "premier_league"
+    return None
+
+def _eligible_trade_candidates(markets: list[dict]) -> list[dict]:
+    """Rank only PL/weather opportunities, preserving the overall opportunity order."""
+    return [market for market in markets if _trade_bucket(market) is not None]
+
+
+def _utc_trade_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+async def _daily_trade_usage(store) -> dict:
+    default = {"premier_league": 0, "weather": 0, "total": 0}
+    try:
+        usage = await store.get_json(f"trading:daily:{_utc_trade_day()}", default)
+        if not isinstance(usage, dict):
+            return default
+        return {
+            "premier_league": max(0, int(usage.get("premier_league", 0) or 0)),
+            "weather": max(0, int(usage.get("weather", 0) or 0)),
+            "total": max(0, int(usage.get("total", 0) or 0)),
+        }
+    except Exception:
+        return default
+
+async def _record_daily_trade(store, bucket: str) -> dict:
+    usage = await _daily_trade_usage(store)
+    if bucket in DAILY_TRADE_LIMITS:
+        usage[bucket] += 1
+    usage["total"] = usage["premier_league"] + usage["weather"]
+    await store.put_json(f"trading:daily:{_utc_trade_day()}", usage)
+    return usage
+
 class Default(CryptoDefault):
     async def _discover_polymarket(self) -> list[dict]:
         found: list[dict] = []
@@ -251,7 +296,28 @@ class Default(CryptoDefault):
         markets = await self._discover_polymarket()
         max_markets = max(1, int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8")))
         selected = markets[:max_markets]
-        research, decisions, history_count = await self._research_and_decide(store, selected)
+        trade_candidates = _eligible_trade_candidates(markets)
+        usage = await _daily_trade_usage(store)
+        trade_selected: list[dict] = []
+        bucket_counts = {"premier_league": 0, "weather": 0}
+        for market in trade_candidates:
+            bucket = _trade_bucket(market)
+            if bucket is None or bucket_counts[bucket] >= DAILY_TRADE_LIMITS[bucket]:
+                continue
+            if bucket == "premier_league" and bucket_counts[bucket] >= 2:
+                continue
+            if bucket == "weather" and bucket_counts[bucket] >= 1:
+                continue
+            if usage.get(bucket, 0) >= DAILY_TRADE_LIMITS[bucket]:
+                continue
+            trade_selected.append(market)
+            bucket_counts[bucket] += 1
+            if len(trade_selected) >= 3:
+                break
+
+        # Research exactly the daily trade slots: up to 2 PL + 1 weather.
+        # Other sports remain visible in discovery but cannot consume execution slots.
+        research, decisions, history_count = await self._research_and_decide(store, trade_selected)
         execution_results: list[dict] = []
         try:
             execution_client = GeminiRotator(self.env, "EXECUTION")
@@ -259,17 +325,27 @@ class Default(CryptoDefault):
             execution_client = None
             execution_results.append({"status": "unavailable", "error": str(exc)})
         trader = PolymarketTrader(self.env)
-        for decision_item in decisions[:5]:
+        for decision_item in decisions[:3]:
             if not execution_client:
                 break
             subject = decision_item.get("subject") or "unknown market"
-            market = next((m for m in selected if (m.get("question") or m.get("slug")) == subject), None)
+            market = next((m for m in trade_selected if (m.get("question") or m.get("slug")) == subject), None)
             decision_text = decision_item.get("text")
-            if not market or not decision_text:
+            bucket = _trade_bucket(market or {})
+            if not market or not decision_text or bucket not in DAILY_TRADE_LIMITS:
+                continue
+            usage = await _daily_trade_usage(store)
+            if usage.get(bucket, 0) >= DAILY_TRADE_LIMITS[bucket] or usage.get("total", 0) >= 3:
+                execution_results.append({"subject": subject, "status": "daily_limit", "bucket": bucket, "reason": "daily trading limit reached"})
+                continue
+            if not market.get("is_open"):
+                execution_results.append({"subject": subject, "status": "not_open", "bucket": bucket, "reason": "market is not accepting orders"})
                 continue
             prompt = json.dumps({
                 "task": "Validate this decision for safe execution; PASS when stale, illiquid or outside limits.",
-                "market": market, "decision": decision_text,
+                "market": market,
+                "decision": decision_text,
+                "trade_policy": {"bucket": bucket, "daily_limit": DAILY_TRADE_LIMITS[bucket], "used_today": usage.get(bucket, 0), "total_daily_limit": 3, "total_used_today": usage.get("total", 0)},
                 "execution_mode": "live" if trader.live else "dry_run",
                 "risk_limits": {"max_order_usd": trader.max_order_usd, "min_edge": trader.min_edge, "min_confidence": trader.min_confidence, "min_entry_price": trader.min_price, "max_entry_price": trader.max_price},
                 "output_schema": {"action": "BUY_YES | BUY_NO | PASS", "outcome": "exact outcome label", "price": "0..1", "size": "shares", "amount_usd": "USD spend", "reason": "concise reason"},
@@ -277,10 +353,14 @@ class Default(CryptoDefault):
             try:
                 result = await trader.execute(market, await execution_client.execute(prompt))
                 result["subject"] = subject
+                result["bucket"] = bucket
                 execution_results.append(result)
                 await store.record_decision("polymarket_execution", subject, result)
+                if trader.live and result.get("executed"):
+                    await _record_daily_trade(store, bucket)
             except Exception as exc:
                 execution_results.append({"subject": subject, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        final_usage = await _daily_trade_usage(store)
         return {
             "source": "Polymarket public-search + TheSportsDB + Open-Meteo + Gemini",
             "markets_seen": len(markets),
@@ -291,10 +371,18 @@ class Default(CryptoDefault):
             "active_not_accepting_orders": sum(bool(m.get("active")) and not bool(m.get("closed")) and not bool(m.get("accepting_orders")) for m in markets),
             "premier_league_markets": sum("premier league" in str(m.get("question") or "").lower() for m in markets),
             "short_horizon_markets": sum(0 < safe_float(m.get("hours_to_end") if m.get("hours_to_end") is not None else -1) <= 72 for m in markets),
-            "selected": selected, "research": research, "decisions": decisions, "execution": execution_results,
+            "selected": selected,
+            "trade_candidates": trade_selected,
+            "daily_trade_limits": DAILY_TRADE_LIMITS,
+            "daily_trades_used": final_usage,
+            "research": research,
+            "decisions": decisions,
+            "execution": execution_results,
             "historical_decision_records_used": history_count,
-            "sports_data_source": "TheSportsDB free v1", "weather_data_source": "Open-Meteo",
-            "polymarket_trading_configured": trader.configured, "polymarket_live_trading": trader.live,
+            "sports_data_source": "TheSportsDB free v1",
+            "weather_data_source": "Open-Meteo",
+            "polymarket_trading_configured": trader.configured,
+            "polymarket_live_trading": trader.live,
             "live_execution": False,
         }
 
@@ -302,14 +390,16 @@ class Default(CryptoDefault):
         if scan != "polymarket":
             return super().format_alert(scan, payload)
         mode = "LIVE" if payload.get("polymarket_live_trading") else "DRY RUN"
+        usage = payload.get("daily_trades_used") or {}
         lines = [
             f"InfoTrader Polymarket sports/weather scan ({mode})",
             f"Markets: {payload.get('markets_seen', 0)} | Sports: {payload.get('sports_markets', 0)} | Weather: {payload.get('weather_markets', 0)}",
             f"OPEN markets: {payload.get('open_markets', 0)} | Active: {payload.get('active_markets', 0)} | Orders off: {payload.get('active_not_accepting_orders', 0)}",
             f"Premier League: {payload.get('premier_league_markets', 0)} | <=72h: {payload.get('short_horizon_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
-            "", "Top short-horizon opportunities:",
+            f"Daily trade budget: PL {usage.get('premier_league', 0)}/2 | Weather {usage.get('weather', 0)}/1 | Total {usage.get('total', 0)}/3",
+            "", "Top short-horizon trade candidates:",
         ]
-        for item in (payload.get("selected") or [])[:5]:
+        for item in (payload.get("trade_candidates") or [])[:5]:
             status = "OPEN" if item.get("is_open") else "ACTIVE • ORDERS OFF" if item.get("active") and not item.get("closed") else "CLOSED"
             horizon = _format_horizon(item.get("hours_to_end"))
             lines.append(
