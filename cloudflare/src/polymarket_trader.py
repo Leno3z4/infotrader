@@ -12,8 +12,6 @@ import json
 import re
 from typing import Any
 
-from workers import fetch
-
 
 class PolymarketTradingError(RuntimeError):
     pass
@@ -85,6 +83,7 @@ class PolymarketTrader:
         return True, "risk checks passed"
 
     async def execute(self, market: dict[str, Any], execution_decision: dict[str, Any]) -> dict[str, Any]:
+        """Validate locally, then delegate to the executor over HTTPS when live."""
         parsed = self._parse_decision(execution_decision)
         action = str(parsed.get("action", "PASS")).upper()
         outcome = str(parsed.get("outcome", "")).strip()
@@ -139,6 +138,10 @@ class PolymarketTrader:
             }
 
         try:
+            # Import the Workers runtime only inside the execution path. This keeps
+            # the ordinary CPython test suite importable outside the Worker runtime.
+            from workers import fetch
+
             response = await fetch(
                 f"{self.executor_url}/execute",
                 method="POST",
