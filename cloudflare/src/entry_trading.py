@@ -19,10 +19,13 @@ POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 POLYMARKET_SPORTS_URL = "https://gamma-api.polymarket.com/sports"
 POLYMARKET_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
-# Keep EPL on a dedicated discovery path, but retain a direct search fallback.
+# Keep EPL on a dedicated discovery path, but use multiple independent fallbacks.
+# Some Polymarket responses expose the EPL series as ``series``, ``seriesId`` or
+# ``id``; accepting all of these prevents a metadata-shape change from blanking EPL.
 SPORTS_QUERIES = (
     "Premier League", "NBA", "NFL", "MLB", "NHL", "UFC", "tennis", "cricket", "Formula 1",
 )
+EPL_SEARCH_QUERIES = ("Premier League", "EPL", "Premier League soccer")
 WEATHER_QUERIES = ("weather", "temperature", "rain", "snow")
 SEARCH_LIMIT_PER_TYPE = 20
 EPL_EVENT_LIMIT = 60
@@ -224,24 +227,30 @@ async def _record_daily_trade(store, bucket: str) -> dict:
 
 
 async def _discover_premier_league() -> list[dict]:
-    """Discover EPL through structured metadata and direct search fallback."""
+    """Discover EPL using structured metadata plus several direct-search fallbacks."""
     structured: list[dict] = []
     try:
         sports = await fetch_json(POLYMARKET_SPORTS_URL)
-        entries = sports if isinstance(sports, list) else []
+        entries = sports if isinstance(sports, list) else (sports.get("sports", []) if isinstance(sports, dict) else [])
         epl = next(
             (
                 item for item in entries
                 if isinstance(item, dict)
                 and (
-                    str(item.get("sport", "")).lower() == "epl"
+                    str(item.get("sport", "")).lower() in {"epl", "premier league", "soccer"}
                     or "premier league" in str(item.get("name", "")).lower()
                     or "premier league" in str(item.get("title", "")).lower()
                 )
             ),
             None,
         )
-        series_id = epl.get("series") if epl else None
+        series_id = None
+        if epl:
+            for field in ("series", "seriesId", "series_id", "id"):
+                value = epl.get(field)
+                if value:
+                    series_id = value
+                    break
         if series_id:
             events = await fetch_json(
                 f"{POLYMARKET_EVENTS_URL}?series_id={quote_plus(str(series_id))}&active=true&closed=false&limit={EPL_EVENT_LIMIT}"
@@ -251,20 +260,24 @@ async def _discover_premier_league() -> list[dict]:
         print(f"POLYMARKET EPL STRUCTURED DISCOVERY ERROR: {type(exc).__name__}: {exc}")
 
     direct: list[dict] = []
-    try:
-        payload = await fetch_json(
-            f"{POLYMARKET_SEARCH_URL}?q={quote_plus('Premier League')}&limit_per_type={SEARCH_LIMIT_PER_TYPE}&events_status=active&search_tags=true"
-        )
-        direct = _search_markets(payload)
-    except Exception as exc:
-        print(f"POLYMARKET EPL DIRECT SEARCH ERROR: {type(exc).__name__}: {exc}")
+    direct_queries_used: list[str] = []
+    for query in EPL_SEARCH_QUERIES:
+        try:
+            payload = await fetch_json(
+                f"{POLYMARKET_SEARCH_URL}?q={quote_plus(query)}&limit_per_type={SEARCH_LIMIT_PER_TYPE}&events_status=active&search_tags=true"
+            )
+            rows = _search_markets(payload)
+            direct.extend(rows)
+            direct_queries_used.append(query)
+        except Exception as exc:
+            print(f"POLYMARKET EPL DIRECT SEARCH ERROR: {query}: {type(exc).__name__}: {exc}")
 
     found = structured + direct
     for market in found:
         market["market_kind"] = "sports"
         market["premier_league"] = True
         market["epl_discovery"] = "sports_metadata_series" if market in structured else "direct_search_fallback"
-    print(f"POLYMARKET EPL DISCOVERY: structured={len(structured)} direct={len(direct)} total={len(found)}")
+    print(f"POLYMARKET EPL DISCOVERY: structured={len(structured)} direct={len(direct)} queries={direct_queries_used} total={len(found)}")
     return found
 
 
@@ -310,7 +323,6 @@ class Default(CryptoDefault):
             market["liquidity_score"] = market["opportunity_score"]
 
         max_markets = max(1, int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8")))
-        trade_candidates_unlimited = _eligible_trade_candidates(markets)
 
         short_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 0 < m["hours_to_end"] <= 72)]
         medium_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 72 < m["hours_to_end"] <= 168)]
