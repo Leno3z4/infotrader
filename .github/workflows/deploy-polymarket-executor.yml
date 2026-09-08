@@ -1,0 +1,33 @@
+name: deploy-polymarket-executor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloudflare/polymarket-executor/**"
+      - ".github/workflows/deploy-polymarket-executor.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloudflare/polymarket-executor/package-lock.json
+
+      - name: Install dependencies
+        working-directory: cloudflare/polymarket-executor
+        run: npm install
+
+      - name: Deploy executor
+        working-directory: cloudflare/polymarket-executor
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
