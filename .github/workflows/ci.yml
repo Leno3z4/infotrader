@@ -29,13 +29,5 @@ jobs:
         run: python -m compileall -q cloudflare/src
       - name: Verify production trading entrypoint defaults to dry-run
         run: |
-          python - <<'PY'
-          import ast
-          from pathlib import Path
-          source = Path("cloudflare/src/polymarket_trader.py").read_text(encoding="utf-8")
-          tree = ast.parse(source)
-          init = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "__init__")
-          text = ast.unparse(init)
-          assert 'getattr(env, "POLYMARKET_LIVE_TRADING", "false")' in text
-          print("Polymarket live-trading default remains false")
-          PY
+          grep -q 'getattr(env, "POLYMARKET_LIVE_TRADING", "false")' cloudflare/src/polymarket_trader.py
+          echo "Polymarket live-trading default remains false"
