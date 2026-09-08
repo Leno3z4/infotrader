@@ -1,8 +1,9 @@
-"""Crypto scanner specialization: enrich DexScreener boost candidates into ranked tokens."""
+"""Crypto scanner: resilient discovery, compact data, and text intelligence."""
 
 from __future__ import annotations
 
 import math
+import re
 from urllib.parse import quote
 
 from workers import fetch
@@ -10,23 +11,35 @@ from workers import fetch
 from entry_scheduled import Default as ScheduledDefault
 from scanner_helpers import extract_tickers, safe_float
 
-DEX_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+DEX_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEX_TOKENS_URL = "https://api.dexscreener.com/tokens/v1"
 NEWS_QUERIES = (
-    "Robinhood crypto token listing",
-    "Robinhood meme coin",
-    "Robinhood mint token crypto",
+    "crypto meme coin",
+    "new meme coin crypto",
+    "Robinhood crypto listing",
+    "meme coin news",
 )
 OPENSEA_BASE = "https://api.opensea.io/api/v2"
 
 
 class Default(ScheduledDefault):
-    """Use corrected cron dispatch plus an enriched crypto scanner."""
+    """Use corrected cron dispatch plus resilient, ranked crypto intelligence."""
+
+    async def _json(self, url: str) -> tuple[object | None, str | None]:
+        try:
+            response = await fetch(url, headers={"accept": "application/json"})
+            if response.ok:
+                return await response.json(), None
+            return None, f"HTTP {response.status}"
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
 
     async def scan_crypto(self, store) -> dict:
         headlines: list[dict] = []
         news_errors: list[str] = []
-        seen: set[str] = set()
-
+        seen_news: set[str] = set()
         for query in NEWS_QUERIES:
             try:
                 response = await fetch(
@@ -35,250 +48,223 @@ class Default(ScheduledDefault):
                 if not response.ok:
                     news_errors.append(f"{query}: HTTP {response.status}")
                     continue
-                text = await response.text()
-                for item in self._rss_items(text, 4):
-                    if item["link"] and item["link"] not in seen:
-                        seen.add(item["link"])
+                for item in self._rss_items(await response.text(), 4):
+                    if item["link"] and item["link"] not in seen_news:
+                        seen_news.add(item["link"])
                         headlines.append(item)
             except Exception as exc:
                 news_errors.append(f"{query}: {type(exc).__name__}: {exc}")
 
-        boosted = await self._fetch_json(DEX_BOOSTS_URL)
+        # /top can be rate-limited. Fall back to /latest, then token profiles.
+        candidates: dict[str, dict] = {}
+        boost_data, boost_error = await self._json(DEX_BOOSTS_TOP_URL)
+        source_used = "top boosts"
+        if boost_data is None:
+            boost_data, fallback_error = await self._json(DEX_BOOSTS_LATEST_URL)
+            source_used = "latest boosts fallback"
+            if boost_data is None:
+                boost_error = f"top={boost_error}; latest={fallback_error}"
+        for row in list(boost_data or [])[:40]:
+            if not isinstance(row, dict):
+                continue
+            chain, address = row.get("chainId"), row.get("tokenAddress")
+            if chain and address:
+                candidates[f"{chain}:{address}"] = row
+
+        if not candidates:
+            profile_data, profile_error = await self._json(DEX_PROFILES_URL)
+            if profile_data is not None:
+                source_used = "latest token profiles fallback"
+                for row in list(profile_data or [])[:40]:
+                    if not isinstance(row, dict):
+                        continue
+                    chain, address = row.get("chainId"), row.get("tokenAddress")
+                    if chain and address:
+                        candidates[f"{chain}:{address}"] = row
+            else:
+                boost_error = f"{boost_error}; profiles={profile_error}"
+
         min_liquidity = float(getattr(self.env, "MIN_LIQUIDITY_USD", "5000"))
         min_volume = float(getattr(self.env, "MIN_VOLUME_24H_USD", "1000"))
-        max_boosts = int(getattr(self.env, "MAX_BOOST_CANDIDATES", "25"))
+        max_candidates = min(40, int(getattr(self.env, "MAX_BOOST_CANDIDATES", "25")))
         max_tokens = int(getattr(self.env, "MAX_POTENTIAL_TOKENS", "10"))
 
-        potential_tokens: list[dict] = []
+        by_token: dict[str, dict] = {}
         enrichment_errors: list[str] = []
+        grouped: dict[str, list[str]] = {}
+        for key in list(candidates)[:max_candidates]:
+            chain, address = key.split(":", 1)
+            grouped.setdefault(chain, []).append(address)
 
-        for boost in list(boosted or [])[:max_boosts]:
-            if not isinstance(boost, dict):
+        # DexScreener allows up to 30 addresses per tokens request, avoiding one
+        # request per token and materially lowering rate-limit pressure.
+        pair_rows: dict[str, dict] = {}
+        for chain, addresses in grouped.items():
+            for start in range(0, len(addresses), 30):
+                chunk = addresses[start:start + 30]
+                url = f"{DEX_TOKENS_URL}/{quote(chain, safe='')}/{','.join(quote(a, safe='') for a in chunk)}"
+                data, error = await self._json(url)
+                if error:
+                    enrichment_errors.append(f"{chain}: {error}")
+                    continue
+                for pair in list(data or []):
+                    if not isinstance(pair, dict):
+                        continue
+                    base = pair.get("baseToken") or {}
+                    addr = base.get("address")
+                    if addr:
+                        key = f"{pair.get('chainId') or chain}:{addr}"
+                        current = pair_rows.get(key)
+                        if current is None or (
+                            safe_float(((pair.get("liquidity") or {}).get("usd"))),
+                            safe_float(((pair.get("volume") or {}).get("h24"))),
+                        ) > (
+                            safe_float(((current.get("liquidity") or {}).get("usd"))),
+                            safe_float(((current.get("volume") or {}).get("h24"))),
+                        ):
+                            pair_rows[key] = pair
+
+        for key, boost in candidates.items():
+            pair = pair_rows.get(key)
+            if not pair:
                 continue
-            chain = boost.get("chainId")
-            address = boost.get("tokenAddress")
-            if not chain or not address:
-                continue
-
-            try:
-                raw_pairs = await self._fetch_json(
-                    f"https://api.dexscreener.com/tokens/v1/{quote(str(chain), safe='')}/{quote(str(address), safe='')}"
-                )
-            except Exception as exc:
-                enrichment_errors.append(f"{chain}:{address}: {type(exc).__name__}: {exc}")
-                continue
-
-            pairs = [pair for pair in list(raw_pairs or []) if isinstance(pair, dict)]
-            if not pairs:
-                continue
-
-            # A token can have multiple pools. Pick its best-liquidity pool so
-            # the result represents the actual market rather than the first API row.
-            pair = max(
-                pairs,
-                key=lambda row: (
-                    safe_float(((row.get("liquidity") or {}).get("usd"))),
-                    safe_float(((row.get("volume") or {}).get("h24"))),
-                ),
-            )
-
             liquidity = safe_float(((pair.get("liquidity") or {}).get("usd")))
             volume_24h = safe_float(((pair.get("volume") or {}).get("h24")))
             if liquidity < min_liquidity or volume_24h < min_volume:
                 continue
-
             base = pair.get("baseToken") or {}
-            quote_token = pair.get("quoteToken") or {}
             txns = pair.get("txns") or {}
-            tx_24h = txns.get("h24") or {}
-            tx_1h = txns.get("h1") or {}
-            price_change = pair.get("priceChange") or {}
-
-            buys_24h = int(safe_float(tx_24h.get("buys")))
-            sells_24h = int(safe_float(tx_24h.get("sells")))
-            tx_count_24h = buys_24h + sells_24h
+            h24 = txns.get("h24") or {}
+            changes = pair.get("priceChange") or {}
+            buys = int(safe_float(h24.get("buys")))
+            sells = int(safe_float(h24.get("sells")))
+            tx_count = buys + sells
             boost_amount = safe_float(boost.get("totalAmount"))
-
-            # Stable ranking: liquidity first, then volume, then transaction depth.
-            quality_score = (
-                math.log10(max(liquidity, 1.0)) * 0.55
-                + math.log10(max(volume_24h, 1.0)) * 0.30
-                + math.log10(max(tx_count_24h, 1.0)) * 0.10
-                + math.log10(max(boost_amount, 1.0)) * 0.05
+            momentum = max(-50.0, min(100.0, safe_float(changes.get("h24"))))
+            buy_ratio = buys / max(1, tx_count)
+            score = (
+                math.log10(max(liquidity, 1.0)) * 0.50
+                + math.log10(max(volume_24h, 1.0)) * 0.28
+                + math.log10(max(tx_count, 1.0)) * 0.12
+                + (buy_ratio - 0.5) * 0.06
+                + math.log10(max(boost_amount, 1.0)) * 0.04
+                + max(-0.2, min(0.2, momentum / 250.0))
             )
-
-            socials = [
-                link for link in (boost.get("links") or [])
-                if isinstance(link, dict) and link.get("url")
-            ]
-
-            potential_tokens.append({
-                "rank_score": round(quality_score, 4),
-                "symbol": base.get("symbol"),
-                "name": base.get("name"),
-                "chain": pair.get("chainId") or chain,
-                "token_address": base.get("address") or address,
-                "pair_address": pair.get("pairAddress"),
+            info = pair.get("info") or {}
+            by_token[key] = {
+                "rank_score": round(score, 4),
+                "name": base.get("name") or "Unknown",
+                "symbol": base.get("symbol") or "UNKNOWN",
+                "chain": pair.get("chainId"),
                 "dex": pair.get("dexId"),
-                "pair_url": pair.get("url") or boost.get("url"),
                 "price_usd": safe_float(pair.get("priceUsd")),
-                "price_change_5m_pct": safe_float(price_change.get("m5")),
-                "price_change_1h_pct": safe_float(price_change.get("h1")),
-                "price_change_6h_pct": safe_float(price_change.get("h6")),
-                "price_change_24h_pct": safe_float(price_change.get("h24")),
+                "change_1h_pct": safe_float(changes.get("h1")),
+                "change_6h_pct": safe_float(changes.get("h6")),
+                "change_24h_pct": momentum,
                 "liquidity_usd": liquidity,
-                "liquidity_base": safe_float(((pair.get("liquidity") or {}).get("base"))),
-                "liquidity_quote": safe_float(((pair.get("liquidity") or {}).get("quote"))),
-                "volume_5m_usd": safe_float(((pair.get("volume") or {}).get("m5"))),
-                "volume_1h_usd": safe_float(((pair.get("volume") or {}).get("h1"))),
-                "volume_6h_usd": safe_float(((pair.get("volume") or {}).get("h6"))),
                 "volume_24h_usd": volume_24h,
                 "market_cap_usd": safe_float(pair.get("marketCap")),
                 "fdv_usd": safe_float(pair.get("fdv")),
-                "txns_1h": {
-                    "buys": int(safe_float(tx_1h.get("buys"))),
-                    "sells": int(safe_float(tx_1h.get("sells"))),
-                },
-                "txns_24h": {
-                    "buys": buys_24h,
-                    "sells": sells_24h,
-                    "total": tx_count_24h,
-                },
-                "pair_created_at": pair.get("pairCreatedAt"),
+                "txns_24h": {"buys": buys, "sells": sells, "total": tx_count},
+                "buy_ratio_24h": round(buy_ratio, 3),
                 "boost_amount": boost_amount,
-                "description": boost.get("description"),
-                "project_links": socials,
-                "quote_symbol": quote_token.get("symbol"),
-                "source": "DexScreener Boosts + token pair enrichment",
-            })
+                "description": (boost.get("description") or "")[:300],
+                "websites": [x.get("url") for x in list(info.get("websites") or [])[:2] if isinstance(x, dict) and x.get("url")],
+                "socials": [x for x in list(info.get("socials") or [])[:2] if isinstance(x, dict)],
+                "pair_url": pair.get("url") or boost.get("url"),
+                "token_address": base.get("address"),
+                "source": "DexScreener",
+            }
 
-        potential_tokens.sort(key=lambda row: row["rank_score"], reverse=True)
-        potential_tokens = potential_tokens[:max_tokens]
+        potential_tokens = sorted(by_token.values(), key=lambda x: x["rank_score"], reverse=True)[:max_tokens]
 
-        nft_collections = [
-            slug.strip()
-            for slug in str(getattr(self.env, "NFT_COLLECTIONS", "")).split(",")
-            if slug.strip()
-        ][:5]
-        nfts = []
+        # Optional OpenSea remains isolated from the meme-coin path.
+        nfts: list[dict] = []
+        nft_collections = [s.strip() for s in str(getattr(self.env, "NFT_COLLECTIONS", "")).split(",") if s.strip()][:5]
         opensea_key = getattr(self.env, "OPENSEA_API_KEY", None)
         for slug in nft_collections:
             if not opensea_key:
                 break
-            response = await fetch(
-                f"{OPENSEA_BASE}/collections/{quote(slug)}/stats",
-                headers={"x-api-key": opensea_key, "accept": "application/json"},
-            )
-            if not response.ok:
-                continue
-            stats = await response.json()
-            total = stats.get("total") or {}
-            nfts.append({
-                "slug": slug,
-                "floor_price": total.get("floor_price"),
-                "volume": total.get("volume"),
-                "sales": total.get("sales"),
-                "owners": total.get("num_owners"),
-                "source": "OpenSea",
-            })
+            data, _ = await self._json(f"{OPENSEA_BASE}/collections/{quote(slug)}/stats")
+            if isinstance(data, dict):
+                total = data.get("total") or {}
+                nfts.append({"slug": slug, "floor_price": total.get("floor_price"), "volume": total.get("volume"), "sales": total.get("sales"), "owners": total.get("num_owners"), "source": "OpenSea"})
 
-        gemini_notes = None
-        if self._has_gemini() and (headlines or potential_tokens):
+        ai_text = ""
+        ai_error = None
+        if self._has_gemini() and potential_tokens:
             try:
                 from gemini import GeminiRotator
                 client = GeminiRotator(self.env, "RESEARCH")
-                gemini_notes = await client.research(
-                    self._crypto_research_prompt(headlines, potential_tokens, nfts)
-                )
-                try:
-                    await store.record_research("crypto", "Robinhood/crypto intelligence", gemini_notes)
-                except Exception as exc:
-                    gemini_notes = {**gemini_notes, "storage_error": f"{type(exc).__name__}: {exc}"}
+                packet = {
+                    "task": "Rank the top potential meme coins from current on-chain metrics plus current online information.",
+                    "tokens": [
+                        {k: t.get(k) for k in ("name", "symbol", "chain", "dex", "price_usd", "change_1h_pct", "change_6h_pct", "change_24h_pct", "liquidity_usd", "volume_24h_usd", "market_cap_usd", "txns_24h", "buy_ratio_24h", "boost_amount", "description", "websites", "socials", "pair_url")}
+                        for t in potential_tokens
+                    ],
+                    "news": headlines[:8],
+                    "rules": [
+                        "Use Google Search grounding to check recent online information for the named tokens.",
+                        "Prioritize credible/current sources and distinguish facts from hype.",
+                        "Consider liquidity, volume, transaction balance, momentum, narrative/news, project credibility and obvious scam/risk signals.",
+                        "Do not invent token facts, partnerships, listings, audits, holders, or prices.",
+                        "Return concise plain text, not JSON or markdown tables.",
+                        "Give a 1-10 ranking, why it ranks there, key bullish/bearish facts, risk, and whether it is worth further monitoring.",
+                        "Keep the whole report under 1100 words.",
+                    ],
+                }
+                result = await client.research(json.dumps(packet, separators=(",", ":")))
+                ai_text = str(result.get("text") or "").strip()
+                await store.record_research("crypto", "meme-coin top-10", result)
             except Exception as exc:
-                gemini_notes = {"error": f"{type(exc).__name__}: {exc}"}
+                ai_error = f"{type(exc).__name__}: {exc}"
 
+        text_report = self._build_text_report(potential_tokens, ai_text, headlines)
         return {
-            "source": "Google News + DexScreener + OpenSea + Gemini",
-            "headlines": headlines[:12],
-            "news_errors": news_errors,
-            "tickers": sorted({ticker for row in headlines for ticker in extract_tickers(row["title"])}),
-            "potential_tokens": potential_tokens,
+            "source": "DexScreener + Google News + Gemini",
+            "candidate_source": source_used,
             "candidate_count": len(potential_tokens),
-            "min_liquidity_usd": min_liquidity,
-            "min_volume_24h_usd": min_volume,
-            "enrichment_errors": enrichment_errors[:20],
+            "potential_tokens": potential_tokens,
+            "top_10": potential_tokens,
+            "headlines": headlines[:8],
+            "news_errors": news_errors,
+            "dex_errors": [x for x in [boost_error] if x] + enrichment_errors[:10],
             "nft_collections": nfts,
             "opensea_configured": bool(opensea_key),
-            "nft_collections_configured": bool(nft_collections),
-            "research": gemini_notes,
+            "ai_report": ai_text,
+            "ai_error": ai_error,
+            "text_report": text_report,
         }
 
-    async def _fetch_json(self, url: str):
-        response = await fetch(url, headers={"accept": "application/json"})
-        if not response.ok:
-            raise RuntimeError(f"upstream HTTP {response.status} for {url}")
-        return await response.json()
+    @staticmethod
+    def _build_text_report(tokens: list[dict], ai_text: str, headlines: list[dict]) -> str:
+        lines = ["🔥 INFOTRADER MEME-COIN INTELLIGENCE", f"Top {len(tokens)} current candidates by on-chain quality + current information.", ""]
+        for i, t in enumerate(tokens, 1):
+            lines.append(
+                f"{i}. {t.get('name')} (${t.get('symbol')}) — {t.get('chain')} / {t.get('dex')}\n"
+                f"   Liquidity ${t.get('liquidity_usd', 0):,.0f} | 24h vol ${t.get('volume_24h_usd', 0):,.0f} | "
+                f"24h {t.get('change_24h_pct', 0):+.2f}% | buys/sells {t.get('txns_24h', {}).get('buys', 0):,}/{t.get('txns_24h', {}).get('sells', 0):,}\n"
+                f"   Pair: {t.get('pair_url')}"
+            )
+        if ai_text:
+            lines.extend(["", "🧠 GEMINI ONLINE READ", ai_text])
+        if headlines:
+            lines.extend(["", "📰 RECENT CRYPTO / MEME-COIN NEWS"])
+            lines.extend(f"• {h.get('title')}" for h in headlines[:5])
+        return "\n".join(lines)[:3900]
 
     @staticmethod
     def _rss_items(xml: str, limit: int) -> list[dict]:
         items: list[dict] = []
-        import re
         for block in re.findall(r"<item>(.*?)</item>", xml, flags=re.DOTALL)[:limit]:
             title = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", block, re.DOTALL)
             link = re.search(r"<link>(.*?)</link>", block, re.DOTALL)
             if title:
-                items.append({
-                    "title": (title.group(1) or title.group(2) or "").strip(),
-                    "link": link.group(1).strip() if link else "",
-                })
+                items.append({"title": (title.group(1) or title.group(2) or "").strip(), "link": link.group(1).strip() if link else ""})
         return items
 
     @staticmethod
     def format_alert(scan: str, payload: dict) -> str:
         if scan != "crypto":
             return ScheduledDefault.format_alert(scan, payload)
-
-        tokens = payload.get("potential_tokens", [])
-        lines = [
-            "InfoTrader crypto scan (DRY RUN)",
-            f"Potential tokens: {len(tokens)}",
-            f"Liquidity floor: ${payload.get('min_liquidity_usd', 0):,.0f}",
-            f"24h volume floor: ${payload.get('min_volume_24h_usd', 0):,.0f}",
-            f"Robinhood headlines: {len(payload.get('headlines', []))}",
-            "",
-            "🔥 Potential tokens with liquidity + volume",
-        ]
-
-        for index, token in enumerate(tokens[:8], 1):
-            symbol = token.get("symbol") or "UNKNOWN"
-            name = token.get("name") or symbol
-            links = token.get("project_links") or []
-            social_text = ", ".join(
-                str(link.get("url")) for link in links[:3] if isinstance(link, dict) and link.get("url")
-            )
-            lines.extend([
-                f"{index}. {name} (${symbol})",
-                f"   Chain/Dex: {token.get('chain')} / {token.get('dex')}",
-                f"   Price: ${token.get('price_usd', 0):,.8f}",
-                f"   Liquidity: ${token.get('liquidity_usd', 0):,.0f}",
-                f"   24h volume: ${token.get('volume_24h_usd', 0):,.0f}",
-                f"   24h change: {token.get('price_change_24h_pct', 0):+.2f}%",
-                f"   Market cap: ${token.get('market_cap_usd', 0):,.0f}",
-                f"   FDV: ${token.get('fdv_usd', 0):,.0f}",
-                f"   24h txns: {token.get('txns_24h', {}).get('total', 0):,} "
-                f"(buys {token.get('txns_24h', {}).get('buys', 0):,} / sells {token.get('txns_24h', {}).get('sells', 0):,})",
-                f"   Contract: {token.get('token_address')}",
-                f"   Pair: {token.get('pair_url')}",
-            ])
-            if social_text:
-                lines.append(f"   Links: {social_text}")
-            if token.get("description"):
-                description = " ".join(str(token["description"]).split())
-                lines.append(f"   About: {description[:280]}")
-            lines.append("")
-
-        headlines = payload.get("headlines", [])
-        if headlines:
-            lines.extend(["Latest Robinhood/crypto headlines:"])
-            lines.extend(f"• {row.get('title')}" for row in headlines[:5])
-        return "\n".join(lines)[:3900]
+        return payload.get("text_report") or "InfoTrader crypto scan: no current candidates found."
