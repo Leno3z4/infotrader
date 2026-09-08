@@ -1,0 +1,15 @@
+{
+  "name": "infotrader-polymarket-executor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@polymarket/clob-client-v2": "1.1.0",
+    "viem": "2.46.3"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
