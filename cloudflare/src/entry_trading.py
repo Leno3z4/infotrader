@@ -16,12 +16,23 @@ from scanner_helpers import normalize_market, safe_float
 from sports_context import build_context, classify_market
 
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+POLYMARKET_SPORTS_URL = "https://gamma-api.polymarket.com/sports"
+POLYMARKET_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+# Search remains broad for discovery of other sports/weather, but the EPL has
+# its own metadata-driven discovery path because public text search is not a
+# reliable league enumerator.
 SPORTS_QUERIES = (
-    "Premier League", "NBA", "NFL", "MLB", "NHL", "UFC", "tennis", "cricket", "Formula 1",
+    "NBA", "NFL", "MLB", "NHL", "UFC", "tennis", "cricket", "Formula 1",
 )
 WEATHER_QUERIES = ("weather", "temperature", "rain", "snow")
 SEARCH_LIMIT_PER_TYPE = 20
+EPL_EVENT_LIMIT = 60
+
+# Live trading policy: at most three successful trades per UTC day:
+# two Premier League trades and one weather trade. Other sports can still be
+# discovered/researched but are never eligible for live execution.
 DAILY_TRADE_LIMITS = {"premier_league": 2, "weather": 1}
+
 
 async def fetch_json(url: str, **options):
     response = await fetch(url, **options)
@@ -29,26 +40,36 @@ async def fetch_json(url: str, **options):
         raise RuntimeError(f"upstream HTTP {response.status} for {url}")
     return await response.json()
 
+
 def _search_markets(payload: object) -> list[dict]:
     rows: list[dict] = []
-    if not isinstance(payload, dict):
-        return rows
-    if isinstance(payload.get("markets"), list):
-        rows.extend(x for x in payload["markets"] if isinstance(x, dict))
-    for event in payload.get("events", []) or []:
-        if not isinstance(event, dict):
-            continue
-        for market in event.get("markets", []) or []:
-            if isinstance(market, dict):
-                row = {**market}
-                row.setdefault("eventId", event.get("id"))
-                row.setdefault("category", event.get("category"))
-                rows.append(row)
+    if isinstance(payload, list):
+        rows.extend(x for x in payload if isinstance(x, dict))
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("markets"), list):
+            rows.extend(x for x in payload["markets"] if isinstance(x, dict))
+        for event in payload.get("events", []) or []:
+            if not isinstance(event, dict):
+                continue
+            for market in event.get("markets", []) or []:
+                if isinstance(market, dict):
+                    row = {**market}
+                    row.setdefault("eventId", event.get("id"))
+                    row.setdefault("category", event.get("category"))
+                    row.setdefault("endDate", event.get("endDate"))
+                    row.setdefault("description", event.get("description"))
+                    row.setdefault("eventTitle", event.get("title"))
+                    rows.append(row)
+
     result: list[dict] = []
     seen: set[str] = set()
     for row in rows:
         normalized = normalize_market(row)
         question = normalized.get("question")
+        if not question:
+            question = row.get("eventTitle")
+            if question:
+                normalized["question"] = question
         if not question:
             continue
         accepting = row.get("acceptingOrders", row.get("enableOrderBook", normalized.get("accepting_orders", False)))
@@ -63,6 +84,7 @@ def _search_markets(payload: object) -> list[dict]:
             "category": row.get("category"),
             "description": row.get("description"),
             "event_id": row.get("eventId"),
+            "event_title": row.get("eventTitle"),
             "end_date": row.get("endDate", normalized.get("end_date")),
         })
         key = str(normalized.get("id") or normalized.get("condition_id") or question)
@@ -70,6 +92,7 @@ def _search_markets(payload: object) -> list[dict]:
             seen.add(key)
             result.append(normalized)
     return result
+
 
 def _hours_to_end(market: dict) -> float | None:
     raw = market.get("end_date")
@@ -86,14 +109,16 @@ def _hours_to_end(market: dict) -> float | None:
     except Exception:
         return None
 
+
 def _is_event_market(market: dict) -> bool:
-    text = f"{market.get('question') or ''} {market.get('description') or ''}".lower()
+    text = f"{market.get('question') or ''} {market.get('description') or ''} {market.get('event_title') or ''}".lower()
     if any(term in text for term in (
         "season winner", "champion", "mvp", "top goalscorer", "top scorer", "win the league",
         "make the playoffs", "playoff qualification", "regular season", "cup winner", "tournament winner",
     )):
         return False
     return bool(re.search(r"(?:\bvs\.?\b|\bv\b|\bat\b|@)", text))
+
 
 def _researchability_score(market: dict) -> float:
     question = str(market.get("question") or "").lower()
@@ -107,6 +132,7 @@ def _researchability_score(market: dict) -> float:
     if any(term in question for term in ("nba", "nfl", "mlb", "nhl", "ufc", "tennis", "atp", "wta", "premier league", "soccer", "football", "cricket", "formula 1")):
         score += 10.0
     return min(score, 100.0)
+
 
 def _horizon_score(hours: float | None) -> float:
     if hours is None or hours <= 0:
@@ -122,6 +148,7 @@ def _horizon_score(hours: float | None) -> float:
     if hours <= 336:
         return 12.0
     return 0.0
+
 
 def _market_opportunity_score(market: dict, liquidity_max: float, volume_max: float) -> float:
     liquidity = math.log1p(max(0.0, safe_float(market.get("liquidity"))))
@@ -140,6 +167,7 @@ def _market_opportunity_score(market: dict, liquidity_max: float, volume_max: fl
         + activity_score * 0.10
     )
 
+
 def _format_horizon(hours: float | None) -> str:
     if hours is None:
         return "unknown"
@@ -149,7 +177,9 @@ def _format_horizon(hours: float | None) -> str:
         return f"{hours:.0f}h"
     return f"{hours / 24:.1f}d"
 
+
 def _trade_bucket(market: dict) -> str | None:
+    """Return the only market types allowed to consume the live trade budget."""
     question = str(market.get("question") or "").lower()
     if market.get("market_kind") == "weather":
         return "weather"
@@ -157,11 +187,15 @@ def _trade_bucket(market: dict) -> str | None:
         return "premier_league"
     return None
 
+
 def _eligible_trade_candidates(markets: list[dict]) -> list[dict]:
+    """Only PL/weather can consume live trade slots."""
     return [market for market in markets if _trade_bucket(market) is not None]
+
 
 def _utc_trade_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 
 async def _daily_trade_usage(store) -> dict:
     default = {"premier_league": 0, "weather": 0, "total": 0}
@@ -177,6 +211,7 @@ async def _daily_trade_usage(store) -> dict:
     except Exception:
         return default
 
+
 async def _record_daily_trade(store, bucket: str) -> dict:
     usage = await _daily_trade_usage(store)
     if bucket in DAILY_TRADE_LIMITS:
@@ -185,41 +220,85 @@ async def _record_daily_trade(store, bucket: str) -> dict:
     await store.put_json(f"trading:daily:{_utc_trade_day()}", usage)
     return usage
 
+
+async def _discover_premier_league() -> list[dict]:
+    """Discover EPL through Polymarket's sports metadata and active events."""
+    try:
+        sports = await fetch_json(POLYMARKET_SPORTS_URL)
+        entries = sports if isinstance(sports, list) else []
+        epl = next((item for item in entries if isinstance(item, dict) and str(item.get("sport", "")).lower() == "epl"), None)
+        if not epl:
+            print("POLYMARKET EPL METADATA: not found")
+            return []
+        series_id = epl.get("series")
+        if not series_id:
+            print("POLYMARKET EPL METADATA: no series")
+            return []
+        url = f"{POLYMARKET_EVENTS_URL}?series_id={quote_plus(str(series_id))}&active=true&closed=false&limit={EPL_EVENT_LIMIT}"
+        events = await fetch_json(url)
+        markets = _search_markets(events)
+        for market in markets:
+            market["market_kind"] = "sports"
+            market["premier_league"] = True
+            market["epl_discovery"] = "sports_metadata_series"
+        print(f"POLYMARKET EPL DISCOVERY: {len(markets)} markets")
+        return markets
+    except Exception as exc:
+        print(f"POLYMARKET EPL DISCOVERY ERROR: {type(exc).__name__}: {exc}")
+        return []
+
+
 class Default(CryptoDefault):
     async def _discover_polymarket(self) -> list[dict]:
-        found: list[dict] = []
+        found = await _discover_premier_league()
         for query in SPORTS_QUERIES + WEATHER_QUERIES:
             url = f"{POLYMARKET_SEARCH_URL}?q={quote_plus(query)}&limit_per_type={SEARCH_LIMIT_PER_TYPE}&events_status=active&search_tags=true"
             try:
                 found.extend(_search_markets(await fetch_json(url)))
             except Exception as exc:
                 print(f"POLYMARKET SEARCH ERROR: {query}: {type(exc).__name__}: {exc}")
+
         unique: dict[str, dict] = {}
         for market in found:
             if market.get("closed") or not market.get("active"):
                 continue
             kind = classify_market(str(market.get("question") or ""))
+            if market.get("premier_league"):
+                kind = "sports"
             if kind not in {"sports", "weather"}:
                 continue
             market["market_kind"] = kind
             market["hours_to_end"] = _hours_to_end(market)
             market["is_event_market"] = _is_event_market(market)
+            if not market.get("premier_league"):
+                market["premier_league"] = "premier league" in str(market.get("question") or "").lower()
             key = str(market.get("id") or market.get("condition_id") or market["question"])
-            unique[key] = market
+            existing = unique.get(key)
+            if existing is None or market.get("premier_league"):
+                unique[key] = market
+
         markets = list(unique.values())
         liq_max = max((math.log1p(max(0.0, safe_float(m.get("liquidity")))) for m in markets), default=1.0)
         volume_max = max((math.log1p(max(0.0, safe_float(m.get("volume_24h")))) for m in markets), default=1.0)
         for market in markets:
             market["opportunity_score"] = _market_opportunity_score(market, liq_max, volume_max)
             market["liquidity_score"] = market["opportunity_score"]
+
         max_markets = max(1, int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8")))
         short_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 0 < m["hours_to_end"] <= 72)]
         medium_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 72 < m["hours_to_end"] <= 168)]
+        pl = [m for m in markets if m.get("premier_league")]
+        weather = [m for m in markets if m.get("market_kind") == "weather"]
         if len(short_horizon) >= max_markets:
             ranked = short_horizon
         else:
             ranked = short_horizon + medium_horizon + [m for m in markets if m not in short_horizon and m not in medium_horizon]
         ranked.sort(key=lambda m: (m.get("opportunity_score", 0), safe_float(m.get("volume_24h")), safe_float(m.get("liquidity"))), reverse=True)
+        # Guarantee the trade policy has access to PL and weather candidates even
+        # when neither category wins the global short-horizon ranking.
+        for candidate in sorted(pl, key=lambda m: m.get("opportunity_score", 0), reverse=True)[:2] + sorted(weather, key=lambda m: m.get("opportunity_score", 0), reverse=True)[:1]:
+            if candidate not in ranked[:max_markets]:
+                ranked.append(candidate)
         return ranked
 
     @staticmethod
@@ -298,6 +377,8 @@ class Default(CryptoDefault):
             bucket_counts[bucket] += 1
             if len(trade_selected) >= 3:
                 break
+
+        # Research exactly the daily trade slots: up to 2 PL + 1 weather.
         research, decisions, history_count = await self._research_and_decide(store, trade_selected)
         execution_results: list[dict] = []
         try:
@@ -343,14 +424,14 @@ class Default(CryptoDefault):
                 execution_results.append({"subject": subject, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
         final_usage = await _daily_trade_usage(store)
         return {
-            "source": "Polymarket public-search + TheSportsDB + Open-Meteo + Gemini",
+            "source": "Polymarket sports metadata/events + public-search + TheSportsDB + Open-Meteo + Gemini",
             "markets_seen": len(markets),
             "sports_markets": sum(m.get("market_kind") == "sports" for m in markets),
             "weather_markets": sum(m.get("market_kind") == "weather" for m in markets),
             "open_markets": sum(bool(m.get("is_open")) for m in markets),
             "active_markets": sum(bool(m.get("active")) and not bool(m.get("closed")) for m in markets),
             "active_not_accepting_orders": sum(bool(m.get("active")) and not bool(m.get("closed")) and not bool(m.get("accepting_orders")) for m in markets),
-            "premier_league_markets": sum("premier league" in str(m.get("question") or "").lower() for m in markets),
+            "premier_league_markets": sum(bool(m.get("premier_league")) for m in markets),
             "short_horizon_markets": sum(0 < safe_float(m.get("hours_to_end") if m.get("hours_to_end") is not None else -1) <= 72 for m in markets),
             "selected": selected,
             "trade_candidates": trade_selected,
@@ -372,20 +453,29 @@ class Default(CryptoDefault):
             return super().format_alert(scan, payload)
         mode = "LIVE" if payload.get("polymarket_live_trading") else "DRY RUN"
         usage = payload.get("daily_trades_used") or {}
+        research_by_subject = {str(item.get("subject")): item for item in (payload.get("research") or []) if isinstance(item, dict) and item.get("subject")}
         lines = [
             f"InfoTrader Polymarket sports/weather scan ({mode})",
             f"Markets: {payload.get('markets_seen', 0)} | Sports: {payload.get('sports_markets', 0)} | Weather: {payload.get('weather_markets', 0)}",
             f"OPEN markets: {payload.get('open_markets', 0)} | Active: {payload.get('active_markets', 0)} | Orders off: {payload.get('active_not_accepting_orders', 0)}",
-            f"Premier League: {payload.get('premier_league_markets', 0)} | <=72h: {payload.get('short_horizon_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
+            f"Premier League: {payload.get('premier_league_markets', 0)} active | <=72h: {payload.get('short_horizon_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
             f"Daily trade budget: PL {usage.get('premier_league', 0)}/2 | Weather {usage.get('weather', 0)}/1 | Total {usage.get('total', 0)}/3",
-            "", "Top short-horizon trade candidates:",
+            "", "Trade candidates:",
         ]
-        for item in (payload.get("trade_candidates") or [])[:5]:
+        for item in (payload.get("trade_candidates") or [])[:3]:
             status = "OPEN" if item.get("is_open") else "ACTIVE • ORDERS OFF" if item.get("active") and not item.get("closed") else "CLOSED"
             horizon = _format_horizon(item.get("hours_to_end"))
+            subject = str(item.get("question") or item.get("slug") or "")
+            research = research_by_subject.get(subject) or {}
+            research_text = re.sub(r"\s+", " ", str(research.get("text") or "")).strip()
+            if len(research_text) > 280:
+                research_text = research_text[:277].rstrip() + "..."
+            prices = item.get("outcome_prices") or []
+            price_text = " | ".join(str(p) for p in prices[:3]) if prices else "n/a"
             lines.append(
-                f"• [{status}][{str(item.get('market_kind', 'market')).upper()}] {item.get('question') or item.get('slug')}\n"
+                f"• [{status}][{str(item.get('market_kind', 'market')).upper()}] {subject}\n"
                 f"  Ends in: {horizon} | Score: {item.get('opportunity_score', 0):.1f}\n"
-                f"  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}"
+                f"  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f} | Prices: {price_text}"
+                + (f"\n  Research: {research_text}" if research_text else "")
             )
         return "\n".join(lines)[:3900]
