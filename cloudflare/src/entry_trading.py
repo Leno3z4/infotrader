@@ -18,10 +18,10 @@ class Default(CryptoDefault):
         selected = payload.get("selected") or []
 
         execution_results: list[dict] = []
-        execution_client = None
         try:
             execution_client = GeminiRotator(self.env, "EXECUTION")
         except Exception as exc:
+            execution_client = None
             execution_results.append({"status": "unavailable", "error": str(exc)})
 
         trader = PolymarketTrader(self.env)
@@ -101,16 +101,13 @@ class Default(CryptoDefault):
         payload["polymarket_live_trading"] = trader.live
         return payload
 
-    @staticmethod
-    def format_alert(scan: str, payload: dict) -> str:
-        base = CryptoDefault.format_alert.__func__(CryptoDefault, scan, payload) if scan == "crypto" else None
-        if scan == "crypto" and base:
-            return base
+    def format_alert(self, scan: str, payload: dict) -> str:
         if scan != "polymarket":
-            return super(Default, Default).format_alert(scan, payload)
+            return super().format_alert(scan, payload)
 
+        mode = "LIVE" if payload.get("polymarket_live_trading") else "DRY RUN"
         lines = [
-            "InfoTrader Polymarket scan (DRY RUN)" if not payload.get("polymarket_live_trading") else "InfoTrader Polymarket scan (LIVE)",
+            f"InfoTrader Polymarket scan ({mode})",
             f"Markets scanned: {payload.get('markets_seen', 0)}",
             f"Premier League matches: {payload.get('premier_league_markets', 0)}",
             f"Gemini research: {len(payload.get('research', []))}",
@@ -121,26 +118,26 @@ class Default(CryptoDefault):
         for item in (payload.get("selected") or [])[:5]:
             prices = item.get("outcome_prices") or []
             outcomes = item.get("outcomes") or []
-            pairs = []
+            price_text = []
             for i in range(min(len(prices), len(outcomes))):
                 try:
-                    pairs.append(f"{outcomes[i]} {float(prices[i]):.1%}")
+                    price_text.append(f"{outcomes[i]} {float(prices[i]):.1%}")
                 except (TypeError, ValueError):
                     pass
             lines.append(
                 f"• {item.get('question') or item.get('slug')}\n"
                 f"  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}"
-                + (f"\n  Prices: {', '.join(pairs)}" if pairs else "")
+                + (f"\n  Prices: {', '.join(price_text)}" if price_text else "")
             )
 
         executions = payload.get("execution") or []
         if executions:
             lines.extend(["", "Execution review:"])
             for item in executions[:5]:
+                amount = item.get("amount_usd", 0) or 0
                 lines.append(
                     f"• {item.get('subject', 'unknown')}: "
-                    f"{item.get('action', 'PASS')} | "
-                    f"${item.get('amount_usd', 0):,.2f} | "
+                    f"{item.get('action', 'PASS')} | ${amount:,.2f} | "
                     f"{item.get('reason', item.get('error', 'no reason'))}"
                 )
 
