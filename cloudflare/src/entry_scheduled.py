@@ -6,8 +6,6 @@ removes ambiguity around multiple cron expressions while preserving both
 cadences.
 """
 
-from datetime import datetime, timezone
-
 from workers import env as worker_env
 
 from entry import Default as BaseDefault
@@ -16,12 +14,31 @@ from storage import StateStore
 POLYMARKET_CRON = "*/15 * * * *"
 
 
+def _is_top_of_utc_hour(scheduled_time) -> bool:
+    """Handle both timestamp units seen across Cloudflare Python runtimes.
+
+    The documented ScheduledEvent value is milliseconds, while the deployed
+    Python runtime has also exposed epoch seconds in observed events. Detect
+    the unit by magnitude and use integer modulo arithmetic to keep this path
+    cheap on Cron invocations.
+    """
+    try:
+        value = int(scheduled_time)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if value <= 0:
+        return False
+    if value >= 100_000_000_000:
+        return value % 3_600_000 == 0
+    return value % 3_600 == 0
+
+
 class Default(BaseDefault):
     async def scheduled(self, controller, env, ctx):
         print("CRON HANDLER ENTERED")
         cron = str(getattr(controller, "cron", "") or "")
-        scheduled_ms = getattr(controller, "scheduledTime", None)
-        print(f"CRON CONTROLLER: {cron!r} scheduledTime={scheduled_ms!r}")
+        scheduled_time = getattr(controller, "scheduledTime", None)
+        print(f"CRON CONTROLLER: {cron!r} scheduledTime={scheduled_time!r}")
 
         binding_env = self.env if getattr(self, "env", None) is not None else env
         if getattr(binding_env, "INFOTRADER_STATE", None) is None:
@@ -34,13 +51,7 @@ class Default(BaseDefault):
             return
 
         scan = "polymarket"
-        run_crypto = False
-        if scheduled_ms is not None:
-            try:
-                dt = datetime.fromtimestamp(float(scheduled_ms) / 1000.0, tz=timezone.utc)
-                run_crypto = dt.minute == 0
-            except (TypeError, ValueError, OverflowError):
-                run_crypto = False
+        run_crypto = _is_top_of_utc_hour(scheduled_time)
         print(f"CRON DISPATCH: scan={scan!r} run_crypto={run_crypto}")
 
         if not store.available:
