@@ -45,12 +45,15 @@ def _search_markets(payload: object) -> list[dict]:
         question = normalized.get("question")
         if not question:
             continue
+        accepting = row.get("acceptingOrders", row.get("enableOrderBook", normalized.get("accepting_orders", False)))
         normalized.update({
             "liquidity": safe_float(row.get("liquidity", normalized.get("liquidity"))),
             "volume_24h": safe_float(row.get("volume24hr", row.get("volume24h", normalized.get("volume_24h")))),
             "open_interest": safe_float(row.get("openInterest", 0)),
             "active": bool(row.get("active", True)),
             "closed": bool(row.get("closed", False)),
+            "accepting_orders": bool(accepting),
+            "is_open": bool(row.get("active", True)) and not bool(row.get("closed", False)) and bool(accepting),
             "category": row.get("category"),
             "description": row.get("description"),
             "event_id": row.get("eventId"),
@@ -187,6 +190,9 @@ class Default(CryptoDefault):
             "markets_seen": len(markets),
             "sports_markets": sum(m.get("market_kind") == "sports" for m in markets),
             "weather_markets": sum(m.get("market_kind") == "weather" for m in markets),
+            "open_markets": sum(bool(m.get("is_open")) for m in markets),
+            "active_markets": sum(bool(m.get("active")) and not bool(m.get("closed")) for m in markets),
+            "active_not_accepting_orders": sum(bool(m.get("active")) and not bool(m.get("closed")) and not bool(m.get("accepting_orders")) for m in markets),
             "premier_league_markets": sum("premier league" in str(m.get("question") or "").lower() for m in markets),
             "selected": selected, "research": research, "decisions": decisions, "execution": execution_results,
             "historical_decision_records_used": history_count,
@@ -202,9 +208,11 @@ class Default(CryptoDefault):
         lines = [
             f"InfoTrader Polymarket sports/weather scan ({mode})",
             f"Markets: {payload.get('markets_seen', 0)} | Sports: {payload.get('sports_markets', 0)} | Weather: {payload.get('weather_markets', 0)}",
+            f"OPEN markets: {payload.get('open_markets', 0)} | Active: {payload.get('active_markets', 0)} | Orders off: {payload.get('active_not_accepting_orders', 0)}",
             f"Premier League: {payload.get('premier_league_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
             "", "Top high-liquidity markets:",
         ]
         for item in (payload.get("selected") or [])[:5]:
-            lines.append(f"• [{str(item.get('market_kind', 'market')).upper()}] {item.get('question') or item.get('slug')}\n  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}")
+            status = "OPEN" if item.get("is_open") else "ACTIVE • ORDERS OFF" if item.get("active") and not item.get("closed") else "CLOSED"
+            lines.append(f"• [{status}][{str(item.get('market_kind', 'market')).upper()}] {item.get('question') or item.get('slug')}\n  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}")
         return "\n".join(lines)[:3900]
