@@ -9,8 +9,16 @@ Python trading SDK dependencies are not a reliable fit there.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
+
+# The repository also contains a top-level ``polymarket_trader/`` package used by
+# the CPython test suite. When ``cloudflare/src`` is first on sys.path, this Worker
+# module would otherwise shadow that package and break imports such as
+# ``polymarket_trader.decision_engine``. Exposing the package path here lets Python
+# resolve those submodules without changing the Worker import surface.
+__path__ = [os.path.abspath(os.path.join(os.path.dirname(__file__), "../..", "polymarket_trader"))]
 
 
 class PolymarketTradingError(RuntimeError):
@@ -63,7 +71,6 @@ class PolymarketTrader:
             return False, "unsupported action"
         if action == "PASS":
             return False, "execution decision is PASS"
-
         try:
             edge = float(decision.get("edge", 0) or 0)
             confidence = float(decision.get("confidence", 0) or 0)
@@ -73,7 +80,6 @@ class PolymarketTrader:
             return False, f"edge {edge:.4f} below minimum {self.min_edge:.4f}"
         if confidence < self.min_confidence:
             return False, f"confidence {confidence:.4f} below minimum {self.min_confidence:.4f}"
-
         try:
             price = current_price if current_price is not None else float(decision.get("market_probability", 0) or 0)
         except (TypeError, ValueError):
@@ -92,11 +98,9 @@ class PolymarketTrader:
             size = float(parsed.get("size", 0) or 0)
         except (TypeError, ValueError):
             return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": "invalid numeric order parameters"}
-
         valid, reason = self._validate(parsed, price)
         if not valid:
             return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": reason}
-
         if size <= 0:
             requested_usd = min(self.max_order_usd, float(parsed.get("amount_usd", self.max_order_usd) or self.max_order_usd))
             size = requested_usd / price
@@ -104,51 +108,24 @@ class PolymarketTrader:
             size = self.max_order_usd / price
         if size <= 0:
             return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": "computed order size is zero"}
-
         order = {
             "market": market,
-            "decision": {
-                **parsed,
-                "action": action,
-                "outcome": outcome,
-                "price": price,
-                "size": round(size, 4),
-                "amount_usd": round(size * price, 2),
-            },
+            "decision": {**parsed, "action": action, "outcome": outcome, "price": price, "size": round(size, 4), "amount_usd": round(size * price, 2)},
             "live": self.live,
         }
-
         if not self.live:
-            reason = (
-                "live trading requested but executor is not configured"
-                if self.live_requested
-                else "dry-run: live trading disabled"
-            )
+            reason = "live trading requested but executor is not configured" if self.live_requested else "dry-run: live trading disabled"
             return {
-                "executed": False,
-                "live": False,
-                "simulated": True,
-                "action": action,
-                "outcome": outcome,
-                "price": price,
-                "size": round(size, 4),
-                "amount_usd": round(size * price, 2),
-                "reason": reason,
+                "executed": False, "live": False, "simulated": True, "action": action, "outcome": outcome,
+                "price": price, "size": round(size, 4), "amount_usd": round(size * price, 2), "reason": reason,
                 "next_step": "Set POLYMARKET_EXECUTOR_URL and POLYMARKET_EXECUTOR_TOKEN, then deploy the JS executor separately before enabling live trading.",
             }
-
         try:
-            # Import the Workers runtime only inside the execution path. This keeps
-            # the ordinary CPython test suite importable outside the Worker runtime.
             from workers import fetch
-
             response = await fetch(
                 f"{self.executor_url}/execute",
                 method="POST",
-                headers={
-                    "content-type": "application/json",
-                    "authorization": f"Bearer {self.executor_token}",
-                },
+                headers={"content-type": "application/json", "authorization": f"Bearer {self.executor_token}"},
                 body=json.dumps(order),
             )
             try:
@@ -162,21 +139,10 @@ class PolymarketTrader:
                 payload.setdefault("size", round(size, 4))
                 payload.setdefault("amount_usd", round(size * price, 2))
                 return payload
-            return {
-                "executed": False,
-                "live": False,
-                "action": action,
-                "outcome": outcome,
-                "reason": "executor returned a non-object response",
-            }
+            return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": "executor returned a non-object response"}
         except Exception as exc:
             return {
-                "executed": False,
-                "live": False,
-                "action": action,
-                "outcome": outcome,
-                "price": price,
-                "size": round(size, 4),
-                "amount_usd": round(size * price, 2),
+                "executed": False, "live": False, "action": action, "outcome": outcome, "price": price,
+                "size": round(size, 4), "amount_usd": round(size * price, 2),
                 "reason": f"executor request failed: {type(exc).__name__}: {exc}",
             }
