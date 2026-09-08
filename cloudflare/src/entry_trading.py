@@ -89,7 +89,7 @@ def _is_event_market(market: dict) -> bool:
         "make the playoffs", "playoff qualification", "regular season", "cup winner", "tournament winner",
     )):
         return False
-    return bool(re.search(r"\b(vs\.?|v|at|@)\b", text))
+    return bool(re.search(r"(?:\bvs\.?\b|\bv\b|\bat\b|@)", text))
 
 def _researchability_score(market: dict) -> float:
     question = str(market.get("question") or "").lower()
@@ -176,15 +176,10 @@ class Default(CryptoDefault):
             market["hours_to_end"] = hours
             market["is_event_market"] = _is_event_market(market)
             market["opportunity_score"] = _market_opportunity_score(market, liq_max, volume_max)
-            # Keep a legacy-style metric for any downstream consumers, but the
-            # selection order is now opportunity_score, not liquidity alone.
             market["liquidity_score"] = market["opportunity_score"]
 
-        # Prefer markets that can plausibly resolve within ~3 days. Only fall
-        # back to 7-day/unknown-horizon markets when there are not enough
-        # short-horizon candidates to fill the requested run size.
-        short_horizon = [m for m in markets if (_hours_to_end(m) is not None and 0 < _hours_to_end(m) <= 72)]
-        medium_horizon = [m for m in markets if (_hours_to_end(m) is not None and 72 < _hours_to_end(m) <= 168)]
+        short_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 0 < m["hours_to_end"] <= 72)]
+        medium_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 72 < m["hours_to_end"] <= 168)]
         if len(short_horizon) >= 8:
             ranked = short_horizon
         else:
@@ -293,7 +288,7 @@ class Default(CryptoDefault):
             "active_markets": sum(bool(m.get("active")) and not bool(m.get("closed")) for m in markets),
             "active_not_accepting_orders": sum(bool(m.get("active")) and not bool(m.get("closed")) and not bool(m.get("accepting_orders")) for m in markets),
             "premier_league_markets": sum("premier league" in str(m.get("question") or "").lower() for m in markets),
-            "short_horizon_markets": sum(0 < safe_float(m.get("hours_to_end"), default=-1) <= 72 for m in markets),
+            "short_horizon_markets": sum(0 < safe_float(m.get("hours_to_end") if m.get("hours_to_end") is not None else -1) <= 72 for m in markets),
             "selected": selected, "research": research, "decisions": decisions, "execution": execution_results,
             "historical_decision_records_used": history_count,
             "sports_data_source": "TheSportsDB free v1", "weather_data_source": "Open-Meteo",
