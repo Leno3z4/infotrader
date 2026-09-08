@@ -1,8 +1,9 @@
-"""Polymarket trading adapter with a hard dry-run safety gate.
+"""Polymarket execution client for the Cloudflare Python Worker.
 
-The Cloudflare Python Worker uses Pyodide/WASM, so the native-heavy Polymarket
-Python SDK is intentionally not bundled. Live execution remains disabled until
-a Worker-compatible signing/execution adapter is provided.
+The Python Worker does discovery, research, decisioning, and risk checks. Actual
+wallet signing and CLOB order submission are delegated to a normal JavaScript
+Worker because Cloudflare Python Workers run on Pyodide/WASM and native-heavy
+Python trading SDK dependencies are not a reliable fit there.
 """
 
 from __future__ import annotations
@@ -11,32 +12,36 @@ import json
 import re
 from typing import Any
 
+from workers import fetch
+
 
 class PolymarketTradingError(RuntimeError):
     pass
 
 
 class PolymarketTrader:
-    """Validate execution decisions and safely simulate orders in the Worker."""
+    """Validate execution decisions and delegate live orders to the JS executor."""
 
     def __init__(self, env: Any):
         self.env = env
         requested_live = str(getattr(env, "POLYMARKET_LIVE_TRADING", "false")).lower() == "true"
-        self.live = False
         self.live_requested = requested_live
+        self.executor_url = str(getattr(env, "POLYMARKET_EXECUTOR_URL", "")).strip().rstrip("/")
+        self.executor_token = getattr(env, "POLYMARKET_EXECUTOR_TOKEN", None)
+        self.live = bool(requested_live and self.executor_url and self.executor_token)
         self.enabled = bool(
             getattr(env, "POLYMARKET_PRIVATE_KEY", None)
             and getattr(env, "POLYMARKET_WALLET_ADDRESS", None)
         )
-        self.max_order_usd = float(getattr(env, "POLYMARKET_MAX_ORDER_USD", "10"))
+        self.max_order_usd = float(getattr(env, "POLYMARKET_MAX_ORDER_USD", getattr(env, "MAX_POSITION_USD", "10")))
         self.min_edge = float(getattr(env, "POLYMARKET_MIN_EDGE", "0.05"))
-        self.min_confidence = float(getattr(env, "POLYMARKET_MIN_CONFIDENCE", "0.70"))
+        self.min_confidence = float(getattr(env, "POLYMARKET_MIN_CONFIDENCE", getattr(env, "MIN_CONFIDENCE", "0.70")))
         self.max_price = float(getattr(env, "POLYMARKET_MAX_ENTRY_PRICE", "0.95"))
         self.min_price = float(getattr(env, "POLYMARKET_MIN_ENTRY_PRICE", "0.05"))
 
     @property
     def configured(self) -> bool:
-        return self.enabled
+        return self.enabled or bool(self.executor_url)
 
     @staticmethod
     def _parse_decision(value: dict[str, Any]) -> dict[str, Any]:
@@ -91,13 +96,7 @@ class PolymarketTrader:
 
         valid, reason = self._validate(parsed, price)
         if not valid:
-            return {
-                "executed": False,
-                "live": False,
-                "action": action,
-                "outcome": outcome,
-                "reason": reason,
-            }
+            return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": reason}
 
         if size <= 0:
             requested_usd = min(self.max_order_usd, float(parsed.get("amount_usd", self.max_order_usd) or self.max_order_usd))
@@ -105,15 +104,27 @@ class PolymarketTrader:
         if size * price > self.max_order_usd:
             size = self.max_order_usd / price
         if size <= 0:
-            return {
-                "executed": False,
-                "live": False,
+            return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": "computed order size is zero"}
+
+        order = {
+            "market": market,
+            "decision": {
+                **parsed,
                 "action": action,
                 "outcome": outcome,
-                "reason": "computed order size is zero",
-            }
+                "price": price,
+                "size": round(size, 4),
+                "amount_usd": round(size * price, 2),
+            },
+            "live": self.live,
+        }
 
-        if self.live_requested:
+        if not self.live:
+            reason = (
+                "live trading requested but executor is not configured"
+                if self.live_requested
+                else "dry-run: live trading disabled"
+            )
             return {
                 "executed": False,
                 "live": False,
@@ -123,18 +134,46 @@ class PolymarketTrader:
                 "price": price,
                 "size": round(size, 4),
                 "amount_usd": round(size * price, 2),
-                "reason": "live trading requested but disabled: Polymarket native SDK is not Pyodide-compatible in this Worker",
-                "next_step": "Use a Worker-compatible signing/execution adapter or a dedicated JS trading service.",
+                "reason": reason,
+                "next_step": "Set POLYMARKET_EXECUTOR_URL and POLYMARKET_EXECUTOR_TOKEN, then deploy the JS executor separately before enabling live trading.",
             }
 
-        return {
-            "executed": False,
-            "live": False,
-            "simulated": True,
-            "action": action,
-            "outcome": outcome,
-            "price": price,
-            "size": round(size, 4),
-            "amount_usd": round(size * price, 2),
-            "reason": "dry-run: live trading disabled",
-        }
+        try:
+            response = await fetch(
+                f"{self.executor_url}/execute",
+                method="POST",
+                headers={
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {self.executor_token}",
+                },
+                body=json.dumps(order),
+            )
+            try:
+                payload = await response.json()
+            except Exception:
+                payload = {"reason": await response.text()}
+            if isinstance(payload, dict):
+                payload.setdefault("action", action)
+                payload.setdefault("outcome", outcome)
+                payload.setdefault("price", price)
+                payload.setdefault("size", round(size, 4))
+                payload.setdefault("amount_usd", round(size * price, 2))
+                return payload
+            return {
+                "executed": False,
+                "live": False,
+                "action": action,
+                "outcome": outcome,
+                "reason": "executor returned a non-object response",
+            }
+        except Exception as exc:
+            return {
+                "executed": False,
+                "live": False,
+                "action": action,
+                "outcome": outcome,
+                "price": price,
+                "size": round(size, 4),
+                "amount_usd": round(size * price, 2),
+                "reason": f"executor request failed: {type(exc).__name__}: {exc}",
+            }
