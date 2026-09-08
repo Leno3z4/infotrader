@@ -1,4 +1,9 @@
-"""Polymarket trading adapter with a hard dry-run safety gate."""
+"""Polymarket trading adapter with a hard dry-run safety gate.
+
+The Cloudflare Python Worker uses Pyodide/WASM, so the native-heavy Polymarket
+Python SDK is intentionally not bundled. Live execution remains disabled until
+a Worker-compatible signing/execution adapter is provided.
+"""
 
 from __future__ import annotations
 
@@ -12,16 +17,13 @@ class PolymarketTradingError(RuntimeError):
 
 
 class PolymarketTrader:
-    """Use Polymarket's official Python SDK for authenticated account actions.
-
-    Live order submission is disabled unless POLYMARKET_LIVE_TRADING is exactly
-    "true". The execution Gemini role is still used in dry-run mode so the
-    complete decision -> execution validation path can be tested safely.
-    """
+    """Validate execution decisions and safely simulate orders in the Worker."""
 
     def __init__(self, env: Any):
         self.env = env
-        self.live = str(getattr(env, "POLYMARKET_LIVE_TRADING", "false")).lower() == "true"
+        requested_live = str(getattr(env, "POLYMARKET_LIVE_TRADING", "false")).lower() == "true"
+        self.live = False
+        self.live_requested = requested_live
         self.enabled = bool(
             getattr(env, "POLYMARKET_PRIVATE_KEY", None)
             and getattr(env, "POLYMARKET_WALLET_ADDRESS", None)
@@ -59,50 +61,39 @@ class PolymarketTrader:
         if action == "PASS":
             return False, "execution decision is PASS"
 
-        edge = float(decision.get("edge", 0) or 0)
-        confidence = float(decision.get("confidence", 0) or 0)
+        try:
+            edge = float(decision.get("edge", 0) or 0)
+            confidence = float(decision.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            return False, "edge/confidence must be numeric"
         if edge < self.min_edge:
             return False, f"edge {edge:.4f} below minimum {self.min_edge:.4f}"
         if confidence < self.min_confidence:
             return False, f"confidence {confidence:.4f} below minimum {self.min_confidence:.4f}"
 
-        price = current_price if current_price is not None else float(decision.get("market_probability", 0) or 0)
+        try:
+            price = current_price if current_price is not None else float(decision.get("market_probability", 0) or 0)
+        except (TypeError, ValueError):
+            return False, "entry price must be numeric"
         if price < self.min_price or price > self.max_price:
             return False, f"entry price {price:.4f} outside [{self.min_price:.4f}, {self.max_price:.4f}]"
         return True, "risk checks passed"
-
-    async def get_market(self, slug: str):
-        if not slug:
-            raise PolymarketTradingError("Market slug is required")
-        try:
-            from polymarket import AsyncSecureClient
-        except ImportError as exc:
-            raise PolymarketTradingError(
-                "polymarket-client is not installed in the Worker build"
-            ) from exc
-
-        if not self.configured:
-            raise PolymarketTradingError(
-                "POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS are required"
-            )
-
-        return await AsyncSecureClient.create(
-            private_key=getattr(self.env, "POLYMARKET_PRIVATE_KEY"),
-            wallet=getattr(self.env, "POLYMARKET_WALLET_ADDRESS"),
-        )
 
     async def execute(self, market: dict[str, Any], execution_decision: dict[str, Any]) -> dict[str, Any]:
         parsed = self._parse_decision(execution_decision)
         action = str(parsed.get("action", "PASS")).upper()
         outcome = str(parsed.get("outcome", "")).strip()
-        price = float(parsed.get("price", parsed.get("market_probability", 0)) or 0)
-        size = float(parsed.get("size", 0) or 0)
+        try:
+            price = float(parsed.get("price", parsed.get("market_probability", 0)) or 0)
+            size = float(parsed.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            return {"executed": False, "live": False, "action": action, "outcome": outcome, "reason": "invalid numeric order parameters"}
 
         valid, reason = self._validate(parsed, price)
         if not valid:
             return {
                 "executed": False,
-                "live": self.live,
+                "live": False,
                 "action": action,
                 "outcome": outcome,
                 "reason": reason,
@@ -116,13 +107,13 @@ class PolymarketTrader:
         if size <= 0:
             return {
                 "executed": False,
-                "live": self.live,
+                "live": False,
                 "action": action,
                 "outcome": outcome,
                 "reason": "computed order size is zero",
             }
 
-        if not self.live:
+        if self.live_requested:
             return {
                 "executed": False,
                 "live": False,
@@ -132,37 +123,18 @@ class PolymarketTrader:
                 "price": price,
                 "size": round(size, 4),
                 "amount_usd": round(size * price, 2),
-                "reason": "dry-run: live trading disabled",
+                "reason": "live trading requested but disabled: Polymarket native SDK is not Pyodide-compatible in this Worker",
+                "next_step": "Use a Worker-compatible signing/execution adapter or a dedicated JS trading service.",
             }
 
-        client = await self.get_market(str(market.get("slug") or ""))
-        fetched_market = await client.get_market(slug=str(market.get("slug") or ""))
-        token = fetched_market.outcomes.yes.token_id if action == "BUY_YES" else fetched_market.outcomes.no.token_id
-        if not token:
-            raise PolymarketTradingError(f"No token ID for outcome {outcome or action}")
-
-        response = await client.place_limit_order(
-            token_id=token,
-            side="BUY",
-            price=str(price),
-            size=str(round(size, 2)),
-        )
-        if not response.ok:
-            raise PolymarketTradingError(
-                f"Polymarket order rejected: {response.code}: {response.message}"
-            )
-
         return {
-            "executed": True,
-            "live": True,
-            "simulated": False,
+            "executed": False,
+            "live": False,
+            "simulated": True,
             "action": action,
             "outcome": outcome,
             "price": price,
             "size": round(size, 4),
             "amount_usd": round(size * price, 2),
-            "order_id": response.order_id,
-            "status": response.status,
-            "trade_ids": list(response.trade_ids or []),
-            "transaction_hashes": list(response.transactions_hashes or []),
+            "reason": "dry-run: live trading disabled",
         }
