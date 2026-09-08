@@ -1,8 +1,10 @@
 """Production orchestration entrypoint: targeted sports/weather research -> decision -> execution gate."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import math
+import re
 from urllib.parse import quote_plus
 
 from workers import fetch
@@ -57,6 +59,7 @@ def _search_markets(payload: object) -> list[dict]:
             "category": row.get("category"),
             "description": row.get("description"),
             "event_id": row.get("eventId"),
+            "end_date": row.get("endDate", normalized.get("end_date")),
         })
         key = str(normalized.get("id") or normalized.get("condition_id") or question)
         if key not in seen:
@@ -64,12 +67,86 @@ def _search_markets(payload: object) -> list[dict]:
             result.append(normalized)
     return result
 
-def _liquidity_score(market: dict) -> float:
+def _hours_to_end(market: dict) -> float | None:
+    raw = market.get("end_date")
+    if not raw:
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+def _is_event_market(market: dict) -> bool:
+    text = f"{market.get('question') or ''} {market.get('description') or ''}".lower()
+    if any(term in text for term in (
+        "season winner", "champion", "mvp", "top goalscorer", "top scorer", "win the league",
+        "make the playoffs", "playoff qualification", "regular season", "cup winner", "tournament winner",
+    )):
+        return False
+    return bool(re.search(r"\b(vs\.?|v|at|@)\b", text))
+
+def _researchability_score(market: dict) -> float:
+    question = str(market.get("question") or "").lower()
+    score = 0.0
+    if _is_event_market(market):
+        score += 55.0
+    if any(term in question for term in ("injury", "injuries", "lineup", "starting xi", "roster", "player")):
+        score += 10.0
+    if any(term in question for term in ("weather", "temperature", "rain", "snow", "wind", "storm")):
+        score += 45.0
+    if any(term in question for term in ("nba", "nfl", "mlb", "nhl", "ufc", "tennis", "atp", "wta", "premier league", "soccer", "football")):
+        score += 10.0
+    return min(score, 100.0)
+
+def _horizon_score(hours: float | None) -> float:
+    if hours is None:
+        return 0.0
+    if hours <= 0:
+        return 0.0
+    if 6 <= hours <= 36:
+        return 100.0
+    if hours < 6:
+        return 78.0
+    if hours <= 72:
+        return 72.0
+    if hours <= 168:
+        return 38.0
+    if hours <= 336:
+        return 12.0
+    return 0.0
+
+def _market_opportunity_score(market: dict, liquidity_max: float, volume_max: float) -> float:
+    hours = _hours_to_end(market)
+    liquidity = math.log1p(max(0.0, safe_float(market.get("liquidity"))))
+    volume = math.log1p(max(0.0, safe_float(market.get("volume_24h"))))
+    liq_norm = 100.0 * liquidity / max(liquidity_max, 1.0)
+    vol_norm = 100.0 * volume / max(volume_max, 1.0)
+    activity_score = min(100.0, vol_norm * 0.8 + (100.0 if market.get("is_open") else 0.0) * 0.2)
+    event_score = 100.0 if _is_event_market(market) else 0.0
+    research_score = _researchability_score(market)
+    time_score = _horizon_score(hours)
     return (
-        math.log1p(max(0.0, safe_float(market.get("liquidity")))) * 60
-        + math.log1p(max(0.0, safe_float(market.get("volume_24h")))) * 35
-        + math.log1p(max(0.0, safe_float(market.get("open_interest")))) * 5
+        time_score * 0.40
+        + event_score * 0.20
+        + research_score * 0.15
+        + liq_norm * 0.15
+        + activity_score * 0.10
     )
+
+def _format_horizon(hours: float | None) -> str:
+    if hours is None:
+        return "unknown"
+    if hours < 1:
+        return "<1h"
+    if hours < 24:
+        return f"{hours:.0f}h"
+    return f"{hours / 24:.1f}d"
 
 class Default(CryptoDefault):
     async def _discover_polymarket(self) -> list[dict]:
@@ -88,10 +165,32 @@ class Default(CryptoDefault):
             if kind not in {"sports", "weather"}:
                 continue
             market["market_kind"] = kind
-            market["liquidity_score"] = _liquidity_score(market)
             key = str(market.get("id") or market.get("condition_id") or market["question"])
             unique[key] = market
-        return sorted(unique.values(), key=lambda m: m.get("liquidity_score", 0), reverse=True)
+
+        markets = list(unique.values())
+        liq_max = max((math.log1p(max(0.0, safe_float(m.get("liquidity")))) for m in markets), default=1.0)
+        volume_max = max((math.log1p(max(0.0, safe_float(m.get("volume_24h")))) for m in markets), default=1.0)
+        for market in markets:
+            hours = _hours_to_end(market)
+            market["hours_to_end"] = hours
+            market["is_event_market"] = _is_event_market(market)
+            market["opportunity_score"] = _market_opportunity_score(market, liq_max, volume_max)
+            # Keep a legacy-style metric for any downstream consumers, but the
+            # selection order is now opportunity_score, not liquidity alone.
+            market["liquidity_score"] = market["opportunity_score"]
+
+        # Prefer markets that can plausibly resolve within ~3 days. Only fall
+        # back to 7-day/unknown-horizon markets when there are not enough
+        # short-horizon candidates to fill the requested run size.
+        short_horizon = [m for m in markets if (_hours_to_end(m) is not None and 0 < _hours_to_end(m) <= 72)]
+        medium_horizon = [m for m in markets if (_hours_to_end(m) is not None and 72 < _hours_to_end(m) <= 168)]
+        if len(short_horizon) >= 8:
+            ranked = short_horizon
+        else:
+            ranked = short_horizon + medium_horizon + [m for m in markets if m not in short_horizon and m not in medium_horizon]
+        ranked.sort(key=lambda m: (m.get("opportunity_score", 0), safe_float(m.get("volume_24h")), safe_float(m.get("liquidity"))), reverse=True)
+        return ranked
 
     @staticmethod
     def _research_prompt(market: dict, context: dict, history: list[dict]) -> str:
@@ -194,6 +293,7 @@ class Default(CryptoDefault):
             "active_markets": sum(bool(m.get("active")) and not bool(m.get("closed")) for m in markets),
             "active_not_accepting_orders": sum(bool(m.get("active")) and not bool(m.get("closed")) and not bool(m.get("accepting_orders")) for m in markets),
             "premier_league_markets": sum("premier league" in str(m.get("question") or "").lower() for m in markets),
+            "short_horizon_markets": sum(0 < safe_float(m.get("hours_to_end"), default=-1) <= 72 for m in markets),
             "selected": selected, "research": research, "decisions": decisions, "execution": execution_results,
             "historical_decision_records_used": history_count,
             "sports_data_source": "TheSportsDB free v1", "weather_data_source": "Open-Meteo",
@@ -209,10 +309,15 @@ class Default(CryptoDefault):
             f"InfoTrader Polymarket sports/weather scan ({mode})",
             f"Markets: {payload.get('markets_seen', 0)} | Sports: {payload.get('sports_markets', 0)} | Weather: {payload.get('weather_markets', 0)}",
             f"OPEN markets: {payload.get('open_markets', 0)} | Active: {payload.get('active_markets', 0)} | Orders off: {payload.get('active_not_accepting_orders', 0)}",
-            f"Premier League: {payload.get('premier_league_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
-            "", "Top high-liquidity markets:",
+            f"Short horizon (<=72h): {payload.get('short_horizon_markets', 0)} | Premier League: {payload.get('premier_league_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
+            "", "Top short-horizon opportunities:",
         ]
         for item in (payload.get("selected") or [])[:5]:
             status = "OPEN" if item.get("is_open") else "ACTIVE • ORDERS OFF" if item.get("active") and not item.get("closed") else "CLOSED"
-            lines.append(f"• [{status}][{str(item.get('market_kind', 'market')).upper()}] {item.get('question') or item.get('slug')}\n  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}")
+            horizon = _format_horizon(item.get("hours_to_end"))
+            lines.append(
+                f"• [{status}][{str(item.get('market_kind', 'market')).upper()}] {item.get('question') or item.get('slug')}\n"
+                f"  Ends in: {horizon} | Score: {safe_float(item.get('opportunity_score')):.0f}\n"
+                f"  Liquidity: ${safe_float(item.get('liquidity')):,.0f} | 24h vol: ${safe_float(item.get('volume_24h')):,.0f}"
+            )
         return "\n".join(lines)[:3900]
