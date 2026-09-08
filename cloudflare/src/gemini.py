@@ -20,20 +20,12 @@ DEFAULT_ROLE_KEYS = {
 
 
 class GeminiRotator:
-    """Fail over across Gemini API keys assigned to a specific role.
-
-    Explicit GEMINI_<ROLE>_KEYS values override the defaults. With the default
-    layout, keys 1-2 are research, 3-4 are decision, and 5 is execution.
-    """
+    """Fail over across Gemini API keys assigned to a specific role."""
 
     def __init__(self, env: Any, role: str):
         self.env = env
         self.role = role.upper()
-        configured = [
-            name.strip()
-            for name in str(getattr(env, f"GEMINI_{self.role}_KEYS", "") or "").split(",")
-            if name.strip()
-        ]
+        configured = [name.strip() for name in str(getattr(env, f"GEMINI_{self.role}_KEYS", "") or "").split(",") if name.strip()]
         names = configured or list(DEFAULT_ROLE_KEYS.get(self.role, ()))
         keys = [getattr(env, name, None) for name in names]
         if not keys:
@@ -58,14 +50,17 @@ class GeminiRotator:
 
     async def generate(self, prompt: str, *, research: bool = False, temperature: float = 0.2) -> dict[str, Any]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        # Keep every individual request compact. Callers already select only the
+        # fields that matter; this guard prevents accidental giant debug payloads.
+        prompt = str(prompt)
+        if len(prompt) > 28000:
+            raise GeminiError("Gemini prompt exceeds InfoTrader's 28k character safety budget")
         payload: dict[str, Any] = {
-            "system_instruction": {
-                "parts": [{"text": self._system_instruction(self.role, research)}]
-            },
+            "system_instruction": {"parts": [{"text": self._system_instruction(self.role, research)}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": temperature,
-                "maxOutputTokens": 1600,
+                "maxOutputTokens": 1200,
             },
         }
         if research:
@@ -76,10 +71,7 @@ class GeminiRotator:
             response = await fetch(
                 url,
                 method="POST",
-                headers={
-                    "content-type": "application/json",
-                    "x-goog-api-key": key,
-                },
+                headers={"content-type": "application/json", "x-goog-api-key": key},
                 body=json.dumps(payload),
             )
             data = await response.json()
@@ -93,29 +85,20 @@ class GeminiRotator:
             last_error = f"HTTP {response.status}: {data}"
             if response.status not in (401, 403, 429, 500, 502, 503):
                 break
-
         raise GeminiError(last_error or "Gemini request failed")
 
     @staticmethod
     def _system_instruction(role: str, research: bool) -> str:
         if role == "RESEARCH" or research:
-            return (
-                "You are InfoTrader's research analyst. Use Google Search grounding when useful. "
-                "Prefer recent, primary, official and reputable sources. Separate facts from inference, "
-                "include dates, and never invent injuries, odds, prices, trades, or sources."
-            )
+            return ("You are InfoTrader's research analyst. Use Google Search grounding when useful. "
+                    "Prefer recent, primary, official and reputable sources. Separate facts from inference, "
+                    "include dates, never invent injuries, odds, prices, trades, or sources, and be concise.")
         if role == "EXECUTION":
-            return (
-                "You are InfoTrader's execution risk analyst. You do not have wallet access and you never place trades. "
-                "Review a proposed Polymarket decision plus current market constraints. Return JSON only with fields: "
-                "action (BUY_YES|BUY_NO|PASS), outcome, price, size, amount_usd, reason. Reject stale, overpriced, "
-                "illiquid, undersized, or insufficient-edge trades. Never claim an order was submitted."
-            )
-        return (
-            "You are InfoTrader's decision analyst. Given a market and research packet, estimate fair probability, "
-            "identify edge versus the market price, and recommend PASS unless the evidence supports a meaningful edge. "
-            "Return JSON only. Do not claim a trade was executed."
-        )
+            return ("You are InfoTrader's execution risk analyst. You do not have wallet access and you never place trades. "
+                    "Review the supplied decision and constraints. Return JSON only with action, outcome, price, size, amount_usd, reason. "
+                    "Reject stale, overpriced, illiquid, undersized, or insufficient-edge trades. Never claim an order was submitted.")
+        return ("You are InfoTrader's decision analyst. Given a market and research packet, estimate fair probability and edge. "
+                "Recommend PASS unless evidence supports a meaningful edge. Return JSON only. Do not claim a trade was executed.")
 
     async def research(self, prompt: str) -> dict[str, Any]:
         return await self.generate(prompt, research=True, temperature=0.15)
