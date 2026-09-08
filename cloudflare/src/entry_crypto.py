@@ -83,14 +83,11 @@ class Default(ScheduledDefault):
         volume = safe_float(token.get("volume_24h_usd"))
         tx_count = safe_float(((token.get("txns_24h") or {}).get("total")))
         x_mentions = safe_float(token.get("x_mentions"))
-        buy_ratio = safe_float(token.get("buy_ratio_24h"), 0.5)
+        buy_ratio = safe_float(token.get("buy_ratio_24h"))
         momentum = safe_float(token.get("change_24h_pct"))
 
-        # Missing market cap is not allowed to masquerade as a cheap coin.
         if market_cap <= 0:
             return -999.0
-
-        # Sweet spot: roughly sub-$10M, with a strong preference below $5M.
         if market_cap <= 1_000_000:
             cap_score = 100.0
         elif market_cap <= 5_000_000:
@@ -102,7 +99,6 @@ class Default(ScheduledDefault):
         else:
             cap_score = max(0.0, 30.0 - 25.0 * math.log10(market_cap / 25_000_000))
 
-        # Liquidity is a safety gate, not the thing we are trying to maximize.
         liquidity_score = min(100.0, math.log10(max(liquidity, 1.0)) * 12.0)
         volume_score = min(100.0, math.log10(max(volume, 1.0)) * 11.0)
         activity_score = min(100.0, math.log10(max(tx_count, 1.0)) * 18.0)
@@ -130,7 +126,6 @@ class Default(ScheduledDefault):
         candidates, discovery_errors = await self._discover_from_x(x_posts, max_candidates)
         source_used = "X discovery + DexScreener validation"
 
-        # X is primary. Dex endpoints are only fallback discovery, so a 429 no longer means zero candidates.
         boost_error = None
         if not candidates:
             boost_data, boost_error = await self._json(DEX_BOOSTS_TOP_URL)
@@ -189,8 +184,6 @@ class Default(ScheduledDefault):
             buy_ratio = buys / max(1, tx_count)
             x_mentions = int(candidate.get("x_mentions") or 0)
             market_cap = safe_float(pair.get("marketCap")) or safe_float(pair.get("fdv"))
-            # The caller is specifically for early entries. Do not surface established
-            # large-cap coins merely because they have huge liquidity.
             if market_cap <= 0 or market_cap > max_market_cap:
                 continue
             info = pair.get("info") or {}
