@@ -3,24 +3,14 @@ import {
   ClobClient,
   OrderType,
   Side,
-  SignatureTypeV2,
 } from "@polymarket/clob-client-v2";
 import { createWalletClient, http } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 
 const CLOB_HOST = "https://clob.polymarket.com";
-const MAX_ORDER_USD = Number(envValue("POLYMARKET_MAX_ORDER_USD", "10"));
-const MIN_EDGE = Number(envValue("POLYMARKET_MIN_EDGE", "0.05"));
-const MIN_CONFIDENCE = Number(envValue("POLYMARKET_MIN_CONFIDENCE", "0.70"));
-const MIN_PRICE = Number(envValue("POLYMARKET_MIN_ENTRY_PRICE", "0.05"));
-const MAX_PRICE = Number(envValue("POLYMARKET_MAX_ENTRY_PRICE", "0.95"));
 
-function envValue(name: string, fallback = ""): string {
-  // `env` is injected into handlers below; this helper only documents the
-  // expected defaults. Runtime values are read from handlerEnv instead.
-  return fallback;
-}
+type Env = Record<string, string | undefined>;
 
 type ExecutionRequest = {
   market: Record<string, unknown>;
@@ -65,7 +55,12 @@ function isAuthorized(request: Request, token: string): boolean {
   return Boolean(token) && request.headers.get("authorization") === `Bearer ${token}`;
 }
 
-function riskCheck(decision: ExecutionRequest["decision"], limits: Record<string, number>) {
+function riskCheck(decision: ExecutionRequest["decision"], limits: {
+  minEdge: number;
+  minConfidence: number;
+  minPrice: number;
+  maxPrice: number;
+}) {
   const action = String(decision.action ?? "PASS").toUpperCase();
   if (!["BUY_YES", "BUY_NO", "PASS"].includes(action)) {
     return { ok: false, reason: "unsupported action" };
@@ -83,13 +78,12 @@ function riskCheck(decision: ExecutionRequest["decision"], limits: Record<string
   return { ok: true, reason: "risk checks passed" };
 }
 
-async function buildClient(runtime: Record<string, string>) {
+async function buildClient(runtime: Env) {
   const privateKey = runtime.POLYMARKET_PRIVATE_KEY;
   if (!privateKey) throw new Error("POLYMARKET_PRIVATE_KEY is not configured");
 
   const account = privateKeyToAccount(privateKey as `0x${string}`);
   const signer = createWalletClient({ account, chain: polygon, transport: http() });
-
   const signatureType = Number(runtime.POLYMARKET_SIGNATURE_TYPE ?? "0");
   const funderAddress = runtime.POLYMARKET_FUNDER_ADDRESS || runtime.POLYMARKET_WALLET_ADDRESS || account.address;
   const creds = runtime.POLYMARKET_API_KEY && runtime.POLYMARKET_API_SECRET && runtime.POLYMARKET_API_PASSPHRASE
@@ -102,7 +96,7 @@ async function buildClient(runtime: Record<string, string>) {
 
   if (signatureType === 3 && !creds) {
     throw new Error(
-      "POLY_1271 deposit-wallet execution requires pre-issued CLOB credentials; the current Polymarket L1 auth endpoint does not reliably issue deposit-wallet-bound credentials. Set POLYMARKET_API_KEY/POLYMARKET_API_SECRET/POLYMARKET_API_PASSPHRASE.",
+      "POLY_1271 deposit-wallet execution requires pre-issued CLOB credentials. Set POLYMARKET_API_KEY/POLYMARKET_API_SECRET/POLYMARKET_API_PASSPHRASE.",
     );
   }
 
@@ -127,7 +121,7 @@ async function buildClient(runtime: Record<string, string>) {
 }
 
 export default {
-  async fetch(request: Request, env: Record<string, string>): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method !== "POST" || new URL(request.url).pathname !== "/execute") {
       return Response.json({ ok: true, service: "infotrader-polymarket-executor" });
     }
@@ -144,11 +138,11 @@ export default {
     }
 
     const limits = {
-      maxOrderUsd: Number(env.POLYMARKET_MAX_ORDER_USD ?? "10"),
-      minEdge: Number(env.POLYMARKET_MIN_EDGE ?? "0.05"),
-      minConfidence: Number(env.POLYMARKET_MIN_CONFIDENCE ?? "0.70"),
-      minPrice: Number(env.POLYMARKET_MIN_ENTRY_PRICE ?? "0.05"),
-      maxPrice: Number(env.POLYMARKET_MAX_ENTRY_PRICE ?? "0.95"),
+      maxOrderUsd: asNumber(env.POLYMARKET_MAX_ORDER_USD, 10),
+      minEdge: asNumber(env.POLYMARKET_MIN_EDGE, 0.05),
+      minConfidence: asNumber(env.POLYMARKET_MIN_CONFIDENCE, 0.70),
+      minPrice: asNumber(env.POLYMARKET_MIN_ENTRY_PRICE, 0.05),
+      maxPrice: asNumber(env.POLYMARKET_MAX_ENTRY_PRICE, 0.95),
     };
 
     const checked = riskCheck(body.decision ?? {}, limits);
@@ -157,7 +151,8 @@ export default {
     const action = String(body.decision.action).toUpperCase();
     const outcome = String(body.decision.outcome ?? "").trim();
     const tokenIds = normalizeTokenIds(body.market.clob_token_ids ?? body.market.clobTokenIds);
-    const outcomeIndex = findOutcomeIndex(body.market, outcome || (action === "BUY_YES" ? "Yes" : "No"));
+    const fallbackOutcome = action === "BUY_YES" ? "Yes" : "No";
+    const outcomeIndex = findOutcomeIndex(body.market, outcome || fallbackOutcome);
     const tokenId = outcomeIndex >= 0 ? tokenIds[outcomeIndex] : tokenIds[action === "BUY_NO" ? 1 : 0];
 
     if (!tokenId) {
@@ -187,11 +182,10 @@ export default {
 
     try {
       const client = await buildClient(env);
-      const side = Side.BUY;
       const tickSize = String(body.market.tick_size ?? body.market.tickSize ?? await client.getTickSize(tokenId));
       const negRisk = Boolean(body.market.neg_risk ?? body.market.negRisk ?? await client.getNegRisk(tokenId));
       const response = await client.createAndPostOrder(
-        { tokenID: tokenId, price, size, side },
+        { tokenID: tokenId, price, size, side: Side.BUY },
         { tickSize, negRisk },
         OrderType.GTC,
       );
