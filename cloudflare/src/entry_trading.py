@@ -16,14 +16,18 @@ from scanner_helpers import normalize_market, safe_float
 from sports_context import build_context, classify_market
 
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
-SPORTS_QUERIES = ("Premier League", "NBA", "NFL", "MLB", "NHL", "UFC", "tennis", "Formula 1", "cricket", "rugby", "golf", "WNBA")
-WEATHER_QUERIES = ("weather", "temperature", "rain", "snow", "wind", "hurricane", "storm")
+# Keep discovery broad enough to cover different sports, but small enough that
+# Python Workers do not spend CPU parsing dozens of large search responses.
+SPORTS_QUERIES = (
+    "Premier League", "NBA", "NFL", "MLB", "NHL", "UFC", "tennis", "cricket", "Formula 1",
+)
+WEATHER_QUERIES = ("weather", "temperature", "rain", "snow")
+SEARCH_LIMIT_PER_TYPE = 20
 
 async def fetch_json(url: str, **options):
     response = await fetch(url, **options)
     if not response.ok:
         raise RuntimeError(f"upstream HTTP {response.status} for {url}")
-    return await response.json()
 
 def _search_markets(payload: object) -> list[dict]:
     rows: list[dict] = []
@@ -94,20 +98,18 @@ def _is_event_market(market: dict) -> bool:
 def _researchability_score(market: dict) -> float:
     question = str(market.get("question") or "").lower()
     score = 0.0
-    if _is_event_market(market):
+    if market.get("is_event_market"):
         score += 55.0
     if any(term in question for term in ("injury", "injuries", "lineup", "starting xi", "roster", "player")):
         score += 10.0
-    if any(term in question for term in ("weather", "temperature", "rain", "snow", "wind", "storm")):
+    if market.get("market_kind") == "weather":
         score += 45.0
-    if any(term in question for term in ("nba", "nfl", "mlb", "nhl", "ufc", "tennis", "atp", "wta", "premier league", "soccer", "football")):
+    if any(term in question for term in ("nba", "nfl", "mlb", "nhl", "ufc", "tennis", "atp", "wta", "premier league", "soccer", "football", "cricket", "formula 1")):
         score += 10.0
     return min(score, 100.0)
 
 def _horizon_score(hours: float | None) -> float:
-    if hours is None:
-        return 0.0
-    if hours <= 0:
+    if hours is None or hours <= 0:
         return 0.0
     if 6 <= hours <= 36:
         return 100.0
@@ -122,15 +124,14 @@ def _horizon_score(hours: float | None) -> float:
     return 0.0
 
 def _market_opportunity_score(market: dict, liquidity_max: float, volume_max: float) -> float:
-    hours = _hours_to_end(market)
     liquidity = math.log1p(max(0.0, safe_float(market.get("liquidity"))))
     volume = math.log1p(max(0.0, safe_float(market.get("volume_24h"))))
     liq_norm = 100.0 * liquidity / max(liquidity_max, 1.0)
     vol_norm = 100.0 * volume / max(volume_max, 1.0)
-    activity_score = min(100.0, vol_norm * 0.8 + (100.0 if market.get("is_open") else 0.0) * 0.2)
-    event_score = 100.0 if _is_event_market(market) else 0.0
+    activity_score = min(100.0, vol_norm * 0.8 + (20.0 if market.get("is_open") else 0.0))
+    event_score = 100.0 if market.get("is_event_market") else 0.0
     research_score = _researchability_score(market)
-    time_score = _horizon_score(hours)
+    time_score = _horizon_score(market.get("hours_to_end"))
     return (
         time_score * 0.40
         + event_score * 0.20
@@ -152,11 +153,12 @@ class Default(CryptoDefault):
     async def _discover_polymarket(self) -> list[dict]:
         found: list[dict] = []
         for query in SPORTS_QUERIES + WEATHER_QUERIES:
-            url = f"{POLYMARKET_SEARCH_URL}?q={quote_plus(query)}&limit_per_type=40&events_status=active&search_tags=true"
+            url = f"{POLYMARKET_SEARCH_URL}?q={quote_plus(query)}&limit_per_type={SEARCH_LIMIT_PER_TYPE}&events_status=active&search_tags=true"
             try:
                 found.extend(_search_markets(await fetch_json(url)))
             except Exception as exc:
                 print(f"POLYMARKET SEARCH ERROR: {query}: {type(exc).__name__}: {exc}")
+
         unique: dict[str, dict] = {}
         for market in found:
             if market.get("closed") or not market.get("active"):
@@ -165,6 +167,8 @@ class Default(CryptoDefault):
             if kind not in {"sports", "weather"}:
                 continue
             market["market_kind"] = kind
+            market["hours_to_end"] = _hours_to_end(market)
+            market["is_event_market"] = _is_event_market(market)
             key = str(market.get("id") or market.get("condition_id") or market["question"])
             unique[key] = market
 
@@ -172,15 +176,13 @@ class Default(CryptoDefault):
         liq_max = max((math.log1p(max(0.0, safe_float(m.get("liquidity")))) for m in markets), default=1.0)
         volume_max = max((math.log1p(max(0.0, safe_float(m.get("volume_24h")))) for m in markets), default=1.0)
         for market in markets:
-            hours = _hours_to_end(market)
-            market["hours_to_end"] = hours
-            market["is_event_market"] = _is_event_market(market)
             market["opportunity_score"] = _market_opportunity_score(market, liq_max, volume_max)
             market["liquidity_score"] = market["opportunity_score"]
 
+        max_markets = max(1, int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8")))
         short_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 0 < m["hours_to_end"] <= 72)]
         medium_horizon = [m for m in markets if (m.get("hours_to_end") is not None and 72 < m["hours_to_end"] <= 168)]
-        if len(short_horizon) >= 8:
+        if len(short_horizon) >= max_markets:
             ranked = short_horizon
         else:
             ranked = short_horizon + medium_horizon + [m for m in markets if m not in short_horizon and m not in medium_horizon]
@@ -247,7 +249,7 @@ class Default(CryptoDefault):
 
     async def scan_polymarket(self, store) -> dict:
         markets = await self._discover_polymarket()
-        max_markets = int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8"))
+        max_markets = max(1, int(getattr(self.env, "MAX_MARKETS_PER_RUN", "8")))
         selected = markets[:max_markets]
         research, decisions, history_count = await self._research_and_decide(store, selected)
         execution_results: list[dict] = []
@@ -304,7 +306,7 @@ class Default(CryptoDefault):
             f"InfoTrader Polymarket sports/weather scan ({mode})",
             f"Markets: {payload.get('markets_seen', 0)} | Sports: {payload.get('sports_markets', 0)} | Weather: {payload.get('weather_markets', 0)}",
             f"OPEN markets: {payload.get('open_markets', 0)} | Active: {payload.get('active_markets', 0)} | Orders off: {payload.get('active_not_accepting_orders', 0)}",
-            f"Short horizon (<=72h): {payload.get('short_horizon_markets', 0)} | Premier League: {payload.get('premier_league_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
+            f"Premier League: {payload.get('premier_league_markets', 0)} | <=72h: {payload.get('short_horizon_markets', 0)} | Research: {len(payload.get('research', []))} | Decisions: {len(payload.get('decisions', []))}",
             "", "Top short-horizon opportunities:",
         ]
         for item in (payload.get("selected") or [])[:5]:
@@ -312,7 +314,7 @@ class Default(CryptoDefault):
             horizon = _format_horizon(item.get("hours_to_end"))
             lines.append(
                 f"• [{status}][{str(item.get('market_kind', 'market')).upper()}] {item.get('question') or item.get('slug')}\n"
-                f"  Ends in: {horizon} | Score: {safe_float(item.get('opportunity_score')):.0f}\n"
-                f"  Liquidity: ${safe_float(item.get('liquidity')):,.0f} | 24h vol: ${safe_float(item.get('volume_24h')):,.0f}"
+                f"  Ends in: {horizon} | Score: {item.get('opportunity_score', 0):.1f}\n"
+                f"  Liquidity: ${item.get('liquidity', 0):,.0f} | 24h vol: ${item.get('volume_24h', 0):,.0f}"
             )
         return "\n".join(lines)[:3900]
