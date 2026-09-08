@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "cloudflare" / "src"))
 
 from scanner_helpers import extract_tickers, is_premier_league_market, normalize_market, priority_score
+from sports_context import classify_market
 
 
 def test_worker_classifier_prioritizes_premier_league_market():
@@ -18,3 +19,8 @@ def test_worker_normalizes_encoded_market_lists_and_tickers():
     assert market["outcomes"] == ["Yes", "No"]
     assert market["outcome_prices"] == ["0.6", "0.4"]
     assert extract_tickers("Robinhood lists $DOGE and $PEPE") == ["DOGE", "PEPE"]
+
+
+def test_rainbow_six_is_sports_not_weather():
+    assert classify_market("Will Rainbow Six Siege Team A win?") == "sports"
+    assert classify_market("Will it rain in London tomorrow?") == "weather"
