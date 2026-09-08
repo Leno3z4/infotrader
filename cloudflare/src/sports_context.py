@@ -6,18 +6,27 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import quote, urlencode
 
 FetchJson = Callable[..., Awaitable[Any]]
-SPORT_TERMS = ("premier league", "football", "soccer", "nba", "wnba", "nfl", "mlb", "nhl", "ufc", "mma", "tennis", "atp", "wta", "formula 1", "f1", "cricket", "rugby", "golf", "boxing", "ncaa", "college football", "champions league", "la liga", "bundesliga", "serie a", "ligue 1", "euroleague", "baseball", "basketball", "hockey", "motogp", "nascar", "indian premier league")
+SPORT_TERMS = ("premier league", "football", "soccer", "rainbow six", "rainbow six siege", "nba", "wnba", "nfl", "mlb", "nhl", "ufc", "mma", "tennis", "atp", "wta", "formula 1", "f1", "cricket", "rugby", "golf", "boxing", "ncaa", "college football", "champions league", "la liga", "bundesliga", "serie a", "ligue 1", "euroleague", "baseball", "basketball", "hockey", "motogp", "nascar", "indian premier league")
 WEATHER_TERMS = ("weather", "temperature", "temp", "rain", "precipitation", "snow", "wind", "hurricane", "tornado", "storm", "forecast", "heat", "frost", "humidity")
 SPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 
+def _contains_term(text: str, term: str) -> bool:
+    """Match a term as a word/phrase, not as a substring of another word."""
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text))
+
+
 def classify_market(question: str) -> str | None:
     text = (question or "").lower()
-    if any(term in text for term in WEATHER_TERMS):
+    # Sports wins before weather, and weather terms are word-bounded so
+    # "Rainbow Six" cannot be classified as weather because of "rain".
+    if any(_contains_term(text, term) for term in SPORT_TERMS):
+        return "sports"
+    if any(_contains_term(text, term) for term in WEATHER_TERMS):
         return "weather"
-    return "sports" if any(term in text for term in SPORT_TERMS) else None
+    return None
 
 
 def participants_from_question(question: str) -> list[str]:
