@@ -1,9 +1,9 @@
 """InfoTrader Worker scheduled dispatcher.
 
 One Cloudflare Cron Trigger fires every 15 minutes. Polymarket runs on every
-fire; the crypto caller runs on the top of each UTC hour. Using one trigger
-removes ambiguity around multiple cron expressions while preserving both
-cadences.
+fire; the crypto caller runs during the first minute of each UTC hour. Using
+one trigger removes ambiguity around multiple cron expressions while
+preserving both cadences.
 """
 
 from workers import env as worker_env
@@ -15,12 +15,12 @@ POLYMARKET_CRON = "*/15 * * * *"
 
 
 def _is_top_of_utc_hour(scheduled_time) -> bool:
-    """Handle both timestamp units seen across Cloudflare Python runtimes.
+    """Return True for any scheduled timestamp in minute 00 of a UTC hour.
 
-    The documented ScheduledEvent value is milliseconds, while the deployed
-    Python runtime has also exposed epoch seconds in observed events. Detect
-    the unit by magnitude and use integer modulo arithmetic to keep this path
-    cheap on Cron invocations.
+    Cloudflare's scheduled timestamp can be exposed in seconds or milliseconds
+    by different Python runtime surfaces, and observed events can be a few
+    seconds after the nominal cron boundary. Do not require exact divisibility
+    by one hour; only the minute boundary matters for the hourly crypto run.
     """
     try:
         value = int(scheduled_time)
@@ -29,8 +29,10 @@ def _is_top_of_utc_hour(scheduled_time) -> bool:
     if value <= 0:
         return False
     if value >= 100_000_000_000:
-        return value % 3_600_000 == 0
-    return value % 3_600 == 0
+        # Milliseconds since epoch: minute within hour is under 60,000 ms.
+        return (value % 3_600_000) < 60_000
+    # Seconds since epoch: minute within hour is under 60 s.
+    return (value % 3_600) < 60
 
 
 class Default(BaseDefault):
